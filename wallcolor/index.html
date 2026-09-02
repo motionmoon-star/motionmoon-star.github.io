@@ -1,0 +1,1707 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>WallColor Paint — BLANLUX SATIN DECO</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script type="module">
+import { pipeline, env, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0';
+
+env.allowLocalModels = false;
+
+const $ = id => document.getElementById(id);
+const dropzone = $('dropzone');
+const fileInput = $('fileInput');
+const cameraInput = $('cameraInput');
+const canvas = $('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const paletteEl = $('palette');
+const statusEl = $('status');
+const resetBtn = $('resetBtn');
+const downloadBtn = $('downloadBtn');
+const strengthSlider = $('strength');
+const strengthVal = $('strengthVal');
+const frame = document.querySelector('.frame');
+const baWrap = $('baWrap');
+const baBar = $('baBar');
+const origCanvas = $('origCanvas');
+const origCtx = origCanvas.getContext('2d');
+
+// ---- Nuancier officiel : BLANLUX SATIN DECO — Nuancier Satinée Color (42 teintes) ----
+const PALETTE = [
+  ['01', 'Saumon Foncée', '#F7BA91'], ['02', 'Bois de Rose', '#E9C0B0'],
+  ['03', 'Cappuccino', '#E5C0A3'], ['04', 'Café au Lait', '#F0E2CE'],
+  ['05', 'Gris Clair', '#D8BAC0'], ['06', 'Crevette', '#F6AC8D'],
+  ['07', 'Beige Clair', '#F3E5D8'], ['08', 'Gris Perle', '#C9CDD2'],
+  ['09', 'Vert Tendre', '#D2E5CB'], ['10', "Vert d'Eau", '#C6E3DA'],
+  ['11', 'Blanc de Lait', '#FEFCE5'], ['12', 'Cappuccino Clair', '#FDF6E3'],
+  ['13', 'Lilas', '#C8B2D7'], ['14', 'Mauve', '#876AAC'],
+  ['15', 'Bleu Foncé', '#036BA8'], ['16', 'Rose Clair', '#F8D7DA'],
+  ['17', 'Beige Rosé', '#F5E6D3'], ['18', 'Marron', '#614321'],
+  ['19', 'Vert Pistache', '#B7CF3C'], ['20', 'Violet', '#7B5EA7'],
+  ['21', 'Marron Chocolat', '#784324'], ['22', 'Noir Doux', '#505B5F'],
+  ['23', 'Ivoire', '#FDEBCE'], ['24', 'Bleu Ciel', '#98D7F6'],
+  ['25', 'Rouge Bordeaux', '#BC0A30'], ['26', 'Rouge Vif', '#D50912'],
+  ['27', 'Bleu Canard', '#15B6C2'], ['28', 'Bleu Acier', '#7A8893'],
+  ['29', 'Jaune Soleil', '#FECE00'], ['30', 'Vanilla Latte', '#FCF8DD'],
+  ['31', 'Orange', '#F18303'], ['32', 'Blanc Glacier', '#E8F2FA'],
+  ['33', 'Gris Nuage', '#C0B9A6'], ['34', 'Blanc Pur', '#E3DBD2'],
+  ['35', 'Gris Anthracite', '#4E585C'], ['36', 'Orange Clair', '#F9C6A9'],
+  ['37', 'Beige Sable', '#CABA9F'], ['38', 'Cappuccino Foncé', '#927535'],
+  ['39', 'Brume', '#AAB6B4'], ['40', 'Rose Poudré', '#E9D3E8'],
+  ['41', 'Mauve Clair', '#E2AECF'], ['42', 'Rose Fushia', '#C3509A']
+];
+
+let selectedColor = null;
+let baseImageData = null;
+let coloredImageData = null;
+let wallMask = null;        // Float32Array : alpha du mur 0..1 (contours adoucis)
+let alphaAll = null;        // alpha de tous les murs (avant sélection)
+let regionMap = null;       // Int32Array : id de la zone mur cliquable (0 = pas un mur)
+let regionSizes = null;
+let wallSelection = null;   // id de la zone sélectionnée au clic (null = tous les murs)
+let aiAlpha = null;         // alpha produit par l'IA (avant retouches manuelles)
+let editDelta = null;       // retouches manuelles : + = ajouté au masque, - = effacé
+let editRefine = null;      // poids du pinceau Contour (0..1) par pixel
+const undoStack = [];       // historique des retouches (annulation)
+const refine = { smooth: 0, feather: 0, contrast: 0, shift: 0, hard: 0 };
+let tool = 'none';          // 'none' | 'brush' | 'eraser' | 'refine'
+let brushSize = 34;         // diamètre du pinceau en pixels écran
+const segmenters = {};      // cache des modèles { b0, b2, b3 }
+// Sur mobile : modèle plus léger par défaut (l'appareil photo ferme sinon
+// la page en arrière-plan par manque de mémoire)
+const isMobile = Math.min(window.screen.width, window.screen.height) < 700;
+if (isMobile) env.backends.onnx.wasm.numThreads = 1;
+let quality = isMobile ? 'b0' : 'b3';
+let pendingColor = null;    // couleur à réappliquer après restauration de session
+let photoRatio = null;      // ratio largeur/hauteur de la photo importée (layout mobile 16:9 / 9:16)
+
+// Alpha final = IA + retouches, puis affinage (pinceau contour, lissage,
+// contour progressif, contraste, décalage du bord) — comme Photoshop.
+function combinedAlpha() {
+  if (!aiAlpha) return null;
+  const w = canvas.width, h = canvas.height, n = w * h;
+  let a = new Float32Array(n);
+  for (let p = 0; p < n; p++) {
+    let v = aiAlpha[p] + (editDelta ? editDelta[p] : 0);
+    a[p] = v < 0 ? 0 : v > 1 ? 1 : v;
+  }
+  // Pinceau Contour : aligne le bord sur les contours réels de la photo
+  if (editRefine) {
+    const G = guidedFilter(a, grayscaleGuide(), w, h, 5, 1e-3);
+    for (let p = 0; p < n; p++) {
+      const wt = editRefine[p];
+      if (wt > 0) a[p] += (G[p] - a[p]) * wt;
+    }
+  }
+  if (refine.smooth > 0) a = boxBlur(a, w, h, Math.round(refine.smooth / 100 * 6));
+  if (refine.feather > 0) a = boxBlur(a, w, h, Math.round(refine.feather / 100 * 12));
+  if (refine.contrast > 0) {
+    const width = Math.max(0.03, 1 - refine.contrast / 100 * 0.95);
+    for (let p = 0; p < n; p++) {
+      let t = (a[p] - 0.5) / width + 0.5;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      a[p] = t * t * (3 - 2 * t);
+    }
+  }
+  const s = refine.shift / 200; // décalage du bord : -0.5..+0.5
+  for (let p = 0; p < n; p++) {
+    let v = a[p] + s;
+    a[p] = v < 0 ? 0 : v > 1 ? 1 : v;
+  }
+  if (refine.hard > 0) { // dureté : coupe les bords doux du masque
+    const st = refine.hard / 100 * 0.5;
+    for (let p = 0; p < n; p++) {
+      let t = (a[p] - st) / (1 - 2 * st);
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      a[p] = t * t * (3 - 2 * t);
+    }
+  }
+  return a;
+}
+
+// Recalcul différé (une fois par frame) lors des réglages d'affinage
+let rafPending = false;
+function scheduleRecompute() {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => {
+    rafPending = false;
+    if (!aiAlpha) return;
+    wallMask = combinedAlpha();
+    if (selectedColor) applyColor();
+    if (maskView) renderView();
+  });
+}
+
+const MODELS = {
+  b0: 'Xenova/segformer-b0-finetuned-ade-512-512',
+  b2: 'Xenova/segformer-b2-finetuned-ade-512-512',
+  b3: 'Xenova/segformer-b3-finetuned-ade-512-512'
+};
+const MODEL_LABELS = { b0: 'Rapide', b2: 'Précise', b3: 'Maximale' };
+const MODEL_FALLBACK = { b3: 'b2', b2: 'b0', b0: null };
+
+$('quality').addEventListener('change', e => {
+  const oldQ = quality;
+  quality = e.target.value;
+  if (isMobile && oldQ !== quality) disposeSegmenter(oldQ);
+  if (baseImageData) runSegmentation();
+});
+
+function setStatus(msg, type = '') {
+  statusEl.textContent = msg;
+  statusEl.className = 'status ' + type;
+}
+
+// ---- Construction du nuancier (panneau droit) ----
+PALETTE.forEach(([num, name, hex]) => {
+  const it = document.createElement('button');
+  it.className = 'swatch-item';
+  it.title = num + ' · ' + name;
+  it.innerHTML = `<span class="sq" style="background:${hex}"></span><span class="nm">${num} · ${name}<small>${hex}</small></span>`;
+  it.addEventListener('click', () => selectColor(hex, num + ' · ' + name, it));
+  paletteEl.appendChild(it);
+});
+
+$('colorName').textContent = 'Aucune couleur sélectionnée';
+
+// ---- (bannières défilantes supprimées : en-tête restylé en header fin) ----
+
+function selectColor(hex, name, el) {
+  document.querySelectorAll('.swatch-item').forEach(s => s.classList.remove('selected'));
+  el.classList.add('selected');
+  selectedColor = hex;
+  $('colorName').innerHTML = `<span class="dot" style="background:${hex}"></span>${name} <code>${hex}</code>`;
+  // La couleur s'affiche immédiatement : on quitte l'aperçu du masque
+  maskView = false;
+  $('maskBtn').classList.remove('active');
+  segProgressHide(); // on retire aussi le compteur % de la détection
+  // Nom de la couleur affiché en haut de la photo
+  const badge = $('colorBadge');
+  badge.innerHTML = `<span class="dot" style="background:${hex}"></span>${name} <code>${hex}</code>`;
+  badge.hidden = false;
+  applyColor();
+  persistState();
+}
+
+// ---- Chargement image ----
+function handleFile(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => { loadFromImage(img); URL.revokeObjectURL(url); };
+  img.onerror = () => setStatus('❌ Impossible de lire cette image.', 'err');
+  img.src = url;
+}
+
+function loadFromImage(img, skipSeg) {
+  frame.classList.remove('empty');
+  const maxW = isMobile ? 960 : 1280; // photo plus légère sur mobile (moins de RAM)
+  const scale = Math.min(1, maxW / img.width);
+  canvas.width = Math.round(img.width * scale);
+  canvas.height = Math.round(img.height * scale);
+  photoRatio = img.width / img.height;
+  applyPhotoRatio();
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  baseImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  wallMask = null; coloredImageData = null;
+  alphaAll = null; regionMap = null; regionSizes = null; wallSelection = null;
+  aiAlpha = null; editDelta = null; editRefine = null; undoStack.length = 0; guideCache = null;
+  $('colorBadge').hidden = true;
+  origCanvas.width = canvas.width;
+  origCanvas.height = canvas.height;
+  origCtx.putImageData(baseImageData, 0, 0);
+  baWrap.hidden = true;
+  setBA(50);
+  $('refinePanel').style.display = 'block';
+  $('refineResetBtn').style.display = 'flex';
+  dropzone.style.display = 'none';
+  frame.hidden = false;
+  if (!skipSeg) runSegmentation();
+}
+
+// ---- Layout mobile selon le ratio de la photo importée ----
+// 16:9 (paysage) : photo collée en haut en 1/4 d'écran (comportement validé).
+// 9:16 (portrait) : photo verticale ~3/4 de l'écran, outils/nuancier ~1/4 dessous.
+// Ronds/carrés : comportement par défaut conservé.
+function applyPhotoRatio() {
+  document.body.classList.remove('ratio-land', 'ratio-port');
+  if (!photoRatio) return;
+  if (photoRatio >= 1.45) document.body.classList.add('ratio-land');
+  else if (photoRatio <= 0.7) document.body.classList.add('ratio-port');
+}
+fileInput.addEventListener('change', e => handleFile(e.target.files[0]));
+cameraInput.addEventListener('change', e => handleFile(e.target.files[0]));
+
+$('demoBtn').addEventListener('click', async () => {
+  try {
+    const resp = await fetch('test-photo.jpg');
+    if (!resp.ok) throw new Error('photo exemple introuvable');
+    handleFile(await resp.blob());
+  } catch (e) { setStatus('❌ ' + e.message, 'err'); }
+});
+
+// ---- Appareil photo intégré à la page (anti-fermeture mobile) ----
+// Le flux caméra s'affiche dans l'application : aucune bascule vers une
+// autre app, donc le système ne peut pas fermer la page par manque de RAM.
+let camStream = null;
+async function openCamera() {
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 }, height: { ideal: 1440 }
+      },
+      audio: false
+    });
+    $('camVideo').srcObject = camStream;
+    $('camModal').hidden = false;
+  } catch (e) {
+    // caméra indisponible : message explicite (le repli silencieux vers le
+    // sélecteur échoue hors geste utilisateur sur iOS)
+    setStatus('📷 Caméra intégrée indisponible (' + e.name + '). Utilisez « 📁 Uploader » '
+      + (isSecureContext ? 'après avoir autorisé la caméra dans les réglages.' : '— la caméra en direct exige une connexion sécurisée (site GitHub).'), 'warn');
+  }
+}
+function closeCamera() {
+  if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; }
+  $('camModal').hidden = true;
+}
+$('takePhotoBtn').addEventListener('click', openCamera);
+$('camCancel').addEventListener('click', closeCamera);
+$('camSnap').addEventListener('click', () => {
+  const v = $('camVideo');
+  if (!v.videoWidth) return;
+  const c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0);
+  const img = new Image();
+  img.onload = () => { closeCamera(); loadFromImage(img); };
+  img.src = c.toDataURL('image/jpeg', 0.92);
+});
+
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault(); dropzone.classList.remove('drag');
+  handleFile(e.dataTransfer.files[0]);
+});
+
+resetBtn.addEventListener('click', () => {
+  dropzone.style.display = 'flex';
+  frame.hidden = true;
+  if (document.body.classList.contains('phone')) frame.classList.add('empty');
+  baseImageData = coloredImageData = null; wallMask = null; selectedColor = null;
+  alphaAll = null; regionMap = null; regionSizes = null; wallSelection = null;
+  aiAlpha = null; editDelta = null; editRefine = null; undoStack.length = 0; guideCache = null;
+  $('refinePanel').style.display = 'none';
+  $('refineResetBtn').style.display = 'none';
+  setTool('none');
+  document.querySelectorAll('.swatch-item').forEach(s => s.classList.remove('selected'));
+  $('colorName').textContent = 'Aucune couleur sélectionnée';
+  $('colorBadge').hidden = true;
+  fileInput.value = ''; cameraInput.value = '';
+  photoRatio = null; applyPhotoRatio();
+});
+
+downloadBtn.addEventListener('click', () => {
+  if (!coloredImageData) return;
+  const a = document.createElement('a');
+  a.download = 'wallcolor-ai.png';
+  a.href = canvas.toDataURL('image/png');
+  a.click();
+});
+
+// ---- Curseur Avant / Après (draggable à la souris ou au doigt) ----
+let baDragging = false;
+function setBA(xPct) {
+  const x = Math.min(100, Math.max(0, xPct));
+  baBar.style.left = x + '%';
+  origCanvas.style.clipPath = `inset(0 ${100 - x}% 0 0)`; // gauche = avant, droite = après
+  // les étiquettes s'effacent quand le curseur atteint les bords
+  $('tagL').style.opacity = x > 8 ? 1 : 0;
+  $('tagR').style.opacity = x < 92 ? 1 : 0;
+}
+function baFromEvent(e) {
+  const r = $('canvasBox').getBoundingClientRect();
+  setBA(((e.clientX - r.left) / r.width) * 100);
+}
+baBar.addEventListener('pointerdown', e => {
+  baDragging = true;
+  baBar.setPointerCapture(e.pointerId);
+  baFromEvent(e);
+});
+baBar.addEventListener('pointermove', e => { if (baDragging) baFromEvent(e); });
+baBar.addEventListener('pointerup', () => baDragging = false);
+baBar.addEventListener('pointercancel', () => baDragging = false);
+setBA(50);
+
+// Page unique : l'espace de travail est visible dès l'arrivée,
+// avec le chargeur de photo intégré au centre.
+$('app').style.display = 'grid';
+$('quality').value = quality;
+
+// ---- Mise en page mobile pilotée par JavaScript (fiable sur tous les téléphones) ----
+// Les classes body.mobile / body.phone activent les glissières horizontales.
+function applyLayoutMode() {
+  const w = window.innerWidth || document.documentElement.clientWidth;
+  document.body.classList.toggle('mobile', w <= 1040);
+  document.body.classList.toggle('phone', w <= 700);
+}
+applyLayoutMode();
+window.addEventListener('resize', applyLayoutMode);
+window.addEventListener('orientationchange', applyLayoutMode);
+
+// ---- Anti-redémarrage mobile : sauvegarde et restauration de session ----
+// L'appareil photo peut faire fermer la page par le système (manque de RAM) ;
+// on restaure alors la photo et la couleur automatiquement.
+function persistState() {
+  try {
+    if (!baseImageData) return;
+    sessionStorage.setItem('wc_state', JSON.stringify({
+      photo: canvas.toDataURL('image/jpeg', 0.82),
+      color: selectedColor
+    }));
+  } catch (e) { /* quota dépassé : on ignore */ }
+}
+(function restoreState() {
+  try {
+    const st = JSON.parse(sessionStorage.getItem('wc_state') || 'null');
+    if (!st || !st.photo) return;
+    pendingColor = st.color || null;
+    const img = new Image();
+    img.onload = () => {
+      loadFromImage(img, isMobile);
+      setStatus(isMobile
+        ? '🔄 Photo restaurée — ré-importez la photo pour relancer l\'analyse IA.'
+        : '🔄 Session restaurée — vous pouvez continuer.', 'info');
+    };
+    img.src = st.photo;
+  } catch (e) {}
+})();
+
+// ---- Sélection du mur au clic : ne peindre qu'un seul mur ----
+canvas.addEventListener('click', e => {
+  if (tool !== 'none') return; // un pinceau/gomme est actif : pas de sélection
+  if (!regionMap) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.floor((e.clientX - rect.left) / rect.width * canvas.width);
+  const y = Math.floor((e.clientY - rect.top) / rect.height * canvas.height);
+  if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return;
+  const id = regionMap[y * canvas.width + x];
+  const minSize = canvas.width * canvas.height * 0.004;
+  if (!id || regionSizes[id - 1] < minSize) {
+    setStatus('Cliquez directement sur un mur pour ne peindre que celui-ci.', 'info');
+    return;
+  }
+  if (wallSelection === id) {
+    wallSelection = null;
+    aiAlpha = alphaAll;
+    wallMask = combinedAlpha();
+    setStatus('🎨 Tous les murs sélectionnés — cliquez sur un mur pour n\'en choisir qu\'un.', 'ok');
+  } else {
+    wallSelection = id;
+    const bin = new Uint8Array(canvas.width * canvas.height);
+    for (let p = 0; p < bin.length; p++) bin[p] = regionMap[p] === id ? 1 : 0;
+    aiAlpha = alphaFromBin(bin);
+    editDelta = null; editRefine = null; undoStack.length = 0;
+    wallMask = combinedAlpha();
+    setStatus('🎯 Ce mur seul sera peint — cliquez à nouveau dessus pour reprendre tous les murs.', 'ok');
+  }
+  if (selectedColor) applyColor();
+  if (maskView) renderView();
+});
+
+strengthSlider.addEventListener('input', () => {
+  strengthVal.textContent = Math.round(strengthSlider.value * 100) + '%';
+  if (selectedColor && wallMask) applyColor();
+});
+
+// ---- Outils de retouche du masque (comme les masques Photoshop) ----
+const brushCursor = $('brushCursor');
+function setTool(t) {
+  tool = t;
+  $('selectBtn').classList.toggle('active', t === 'none');
+  $('brushBtn').classList.toggle('active', t === 'brush');
+  $('eraserBtn').classList.toggle('active', t === 'eraser');
+  $('refineBtn').classList.toggle('active', t === 'refine');
+  $('brushBox').style.display = t === 'none' ? 'none' : 'flex';
+  canvas.style.cursor = t === 'none' ? 'crosshair' : 'none';
+  brushCursor.style.display = t === 'none' ? 'none' : 'block';
+  brushCursor.classList.toggle('erase', t === 'eraser');
+  brushCursor.classList.toggle('refine', t === 'refine');
+  canvas.style.touchAction = t === 'none' ? 'auto' : 'none'; // dessin au doigt
+  if (t === 'brush') setStatus('🖌 Sélection rapide : peignez la zone à ajouter — elle épouse les contours des objets.', 'info');
+  else if (t === 'eraser') setStatus('🧽 Peignez les zones à EFFACER (meubles, déco, objets touchés par erreur).', 'info');
+  else if (t === 'refine') setStatus('🪶 Peignez LE LONG des bords à affiner : ils se collent aux contours des objets.', 'info');
+}
+$('selectBtn').addEventListener('click', () => setTool('none'));
+$('brushBtn').addEventListener('click', () => setTool(tool === 'brush' ? 'none' : 'brush'));
+$('eraserBtn').addEventListener('click', () => setTool(tool === 'eraser' ? 'none' : 'eraser'));
+$('refineBtn').addEventListener('click', () => setTool(tool === 'refine' ? 'none' : 'refine'));
+
+$('brushSize').addEventListener('input', e => {
+  brushSize = parseInt(e.target.value, 10);
+  $('brushSizeVal').textContent = brushSize;
+  updateBrushCursorSize();
+});
+
+$('undoBtn').addEventListener('click', () => {
+  const snap = undoStack.pop();
+  if (!snap) { setStatus('Rien à annuler.', 'info'); return; }
+  editDelta = snap.delta;
+  editRefine = snap.refineW;
+  wallMask = combinedAlpha();
+  if (selectedColor) applyColor();
+  if (maskView) renderView();
+  setStatus('↩ Retouche annulée.', 'ok');
+});
+
+$('clearEditsBtn').addEventListener('click', () => {
+  if (!editDelta && !editRefine) { setStatus('Aucune retouche manuelle à effacer.', 'info'); return; }
+  editDelta = null; editRefine = null; undoStack.length = 0;
+  wallMask = combinedAlpha();
+  if (selectedColor) applyColor();
+  if (maskView) renderView();
+  setStatus('♻️ Retouches manuelles effacées — masque IA restauré.', 'ok');
+});
+
+// ---- Réglages d'affinage (Lissage / Contour / Contraste / Décalage) ----
+function bindRefine(id, key) {
+  $(id).addEventListener('input', e => {
+    refine[key] = parseInt(e.target.value, 10);
+    $(id + 'V').textContent = e.target.value;
+    scheduleRecompute();
+  });
+}
+bindRefine('rSmooth', 'smooth');
+bindRefine('rFeather', 'feather');
+bindRefine('rContrast', 'contrast');
+bindRefine('rShift', 'shift');
+bindRefine('rHard', 'hard');
+
+$('refineResetBtn').addEventListener('click', () => {
+  refine.smooth = refine.feather = refine.contrast = refine.shift = refine.hard = 0;
+  for (const [id, v] of [['rSmooth', 0], ['rFeather', 0], ['rContrast', 0], ['rShift', 0], ['rHard', 0]]) {
+    $(id).value = v; $(id + 'V').textContent = v;
+  }
+  scheduleRecompute();
+  setStatus('♻️ Affinage réinitialisé.', 'ok');
+});
+
+function updateBrushCursorSize() {
+  brushCursor.style.width = brushCursor.style.height = brushSize + 'px';
+}
+
+// position en pixels internes du canvas
+function canvasPoint(e) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) / r.width * canvas.width,
+    y: (e.clientY - r.top) / r.height * canvas.height,
+    scale: canvas.width / r.width // px internes par px écran
+  };
+}
+
+frame.addEventListener('pointermove', e => {
+  if (tool === 'none') return;
+  const r = $('canvasBox').getBoundingClientRect();
+  brushCursor.style.left = (e.clientX - r.left) + 'px';
+  brushCursor.style.top = (e.clientY - r.top) + 'px';
+});
+
+let painting = false, lastPt = null;
+canvas.addEventListener('pointerdown', e => {
+  if (tool === 'none' || !aiAlpha) return;
+  painting = true;
+  canvas.setPointerCapture(e.pointerId);
+  // sauvegarde pour l'annulation (max 8 niveaux)
+  undoStack.push({
+    delta: editDelta ? new Float32Array(editDelta) : null,
+    refineW: editRefine ? new Float32Array(editRefine) : null
+  });
+  if (undoStack.length > 8) undoStack.shift();
+  if (tool === 'brush' || tool === 'eraser') {
+    if (!editDelta) editDelta = new Float32Array(canvas.width * canvas.height);
+  } else if (tool === 'refine' && !editRefine) {
+    editRefine = new Float32Array(canvas.width * canvas.height);
+  }
+  const pt = canvasPoint(e);
+  paintStroke(pt, pt);
+  lastPt = pt;
+});
+canvas.addEventListener('pointermove', e => {
+  if (!painting) return;
+  const pt = canvasPoint(e);
+  paintStroke(lastPt, pt);
+  lastPt = pt;
+});
+function endStroke() {
+  if (!painting) return;
+  painting = false; lastPt = null;
+  wallMask = combinedAlpha();
+  if (selectedColor) applyColor();
+  if (maskView) renderView();
+}
+canvas.addEventListener('pointerup', endStroke);
+canvas.addEventListener('pointercancel', endStroke);
+
+// Trace un segment de pinceau à bords doux dans editDelta/editRefine + aperçu
+function paintStroke(from, to) {
+  const mode = tool === 'eraser' ? -1 : tool === 'refine' ? 0 : 1;
+  const r = (brushSize * from.scale) / 2; // rayon en px internes
+  const dist = Math.hypot(to.x - from.x, to.y - from.y);
+  const steps = Math.max(1, Math.ceil(dist / Math.max(1, r * 0.3)));
+  for (let s = 0; s <= steps; s++) {
+    const cx = from.x + (to.x - from.x) * s / steps;
+    const cy = from.y + (to.y - from.y) * s / steps;
+    stamp(cx, cy, r, mode);
+    // aperçu translucide pendant le tracé
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = mode > 0 ? 'rgba(94,230,168,.30)' : mode < 0 ? 'rgba(255,122,122,.30)' : 'rgba(110,198,255,.35)';
+    ctx.fill();
+  }
+}
+
+// Tampon circulaire à bords doux : +1 ajoute, -1 efface, 0 affine le bord.
+// Le mode "ajouter" est intelligent (content-aware) : il ne prend que les
+// pixels dont la couleur ressemble au point peint, et s'arrête sur les
+// contours des meubles/objets — comme la Sélection rapide de Photoshop.
+function stamp(cx, cy, r, mode) {
+  const w = canvas.width, h = canvas.height;
+  const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(w - 1, Math.ceil(cx + r));
+  const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(h - 1, Math.ceil(cy + r));
+  const r2 = r * r;
+  const src = baseImageData.data;
+
+  // couleur de référence au centre du tampon (mise à jour en continu)
+  let sr = 0, sg = 0, sb = 0;
+  if (mode > 0) {
+    const sx = Math.min(w - 1, Math.max(0, cx | 0));
+    const sy = Math.min(h - 1, Math.max(0, cy | 0));
+    const si = (sy * w + sx) * 4;
+    sr = src[si]; sg = src[si + 1]; sb = src[si + 2];
+  }
+
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
+      if (d2 >= r2) continue;
+      const v = 1 - Math.sqrt(d2) / r;     // 1 au centre, 0 au bord
+      const soft = v * v * (3 - 2 * v);    // falloff doux
+      const p = y * w + x;
+      if (mode > 0) {
+        // similarité de couleur avec le point peint : tolérance douce
+        const i = p * 4;
+        const dr = src[i] - sr, dg = src[i + 1] - sg, db = src[i + 2] - sb;
+        const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+        let sim;
+        if (dist <= 55) sim = 1;
+        else if (dist >= 95) sim = 0;
+        else sim = 1 - (dist - 55) / 40;
+        // les pixels déjà détectés comme mur par l'IA s'ajoutent toujours
+        // (permet de prolonger le mur existant malgré les ombres)
+        if (aiAlpha[p] > 0.3) sim = 1;
+        const val = soft * sim;
+        if (val > editDelta[p]) editDelta[p] = val;
+      } else if (mode < 0) {
+        editDelta[p] = Math.min(editDelta[p], -soft);
+      } else {
+        editRefine[p] = Math.max(editRefine[p], soft);
+      }
+    }
+  }
+}
+
+// ---- Barre de progression 1-100 % (téléchargement du modèle + analyse) ----
+let segProgTimer = null, segProgVal = 0;
+function segProgressStart() {
+  segProgVal = 0;
+  clearInterval(segProgTimer);
+  $('segBar').style.width = '0%';
+  $('segPct').textContent = '0%';
+  $('segProgress').hidden = false;
+  segProgTimer = setInterval(() => {
+    // progression douce plafonnée à 90 % tant que l'IA travaille
+    segProgVal = Math.min(90, segProgVal + (90 - segProgVal) * 0.06 + 0.5);
+    segProgVal = Math.min(90, segProgVal);
+    $('segBar').style.width = segProgVal + '%';
+    $('segPct').textContent = Math.round(segProgVal) + '%';
+  }, 120);
+}
+function segProgressDone() {
+  clearInterval(segProgTimer);
+  segProgVal = 100;
+  $('segBar').style.width = '100%';
+  $('segPct').textContent = '100%';
+  setTimeout(() => {
+    $('segProgress').hidden = true;
+    $('segBar').style.width = '0%';
+    $('segPct').textContent = '0%';
+  }, 700);
+}
+function segProgressHide() {
+  clearInterval(segProgTimer);
+  $('segProgress').hidden = true;
+  $('segBar').style.width = '0%';
+  $('segPct').textContent = '0%';
+}
+
+// ---- Segmentation IA (murs uniquement) ----
+let segmenting = false;
+async function runSegmentation() {
+  if (segmenting) return; // une seule analyse à la fois
+  segmenting = true;
+  segProgressStart();
+  try {
+    if (!segmenters[quality]) {
+      setStatus(quality === 'b2'
+        ? '⏳ Téléchargement du modèle Précis (~40 Mo, première fois seulement)…'
+        : '⏳ Téléchargement du modèle Rapide (~15 Mo, première fois seulement)…', 'info');
+    }
+    const segmenter = await getSegmenter();
+    setStatus('🧠 Analyse de la pièce : détection des murs…', 'info');
+    await new Promise(r => setTimeout(r, 30));
+
+    // Entrée : RawImage construite depuis les pixels du canvas (aucun décodage d'image)
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const rawInput = new RawImage(imgData.data, canvas.width, canvas.height, 4);
+    const output = await segmenter(rawInput);
+
+    // "wall" est la classe 0 d'ADE20K ; accepter les deux formes d'étiquette
+    const wallResult = output.find(r => ['wall', '0'].includes(String(r.label).trim()));
+    if (!wallResult || !wallResult.mask) {
+      segProgressHide();
+      setStatus('⚠️ Aucun mur détecté sur cette photo. Essayez une photo plus nette de la pièce.', 'warn');
+      return;
+    }
+
+    wallMask = buildWallAlpha(wallResult.mask);
+    aiAlpha = wallMask;
+    editDelta = null; undoStack.length = 0;
+    canvas.style.cursor = 'crosshair';
+    segProgressDone();
+    setStatus('✅ Murs détectés ! Choisissez une couleur — ou cliquez sur un mur précis pour ne peindre que lui.', 'ok');
+    // Dès 100 % : affiche la sélection des murs détectés sur la photo
+    if (!maskView) {
+      maskView = true;
+      $('maskBtn').classList.add('active');
+    }
+    renderView();
+    // restauration : réapplique la couleur choisie avant le redémarrage
+    if (pendingColor) {
+      const idx = PALETTE.findIndex(p => p[2] === pendingColor);
+      pendingColor = null;
+      if (idx >= 0) paletteEl.children[idx].click();
+    }
+    persistState();
+    // Sur mobile : détruit proprement le modèle IA après chaque analyse
+    // (sinon la 2e photo empile deux moteurs en mémoire et fait planter)
+    if (isMobile) disposeSegmenter(quality);
+  } catch (err) {
+    console.error(err);
+    segProgressHide();
+    setStatus('❌ Erreur IA : ' + err.message, 'err');
+  } finally {
+    segmenting = false;
+  }
+}
+
+// Détruit le moteur IA et libère sa mémoire WASM
+function disposeSegmenter(q) {
+  const s = segmenters[q];
+  if (s) {
+    try { if (typeof s.dispose === 'function') s.dispose(); } catch (e) {}
+    segmenters[q] = null;
+  }
+}
+
+// RawImage (niveaux de gris) -> alpha 0..1 à la taille de la photo, contours adoucis
+function buildWallAlpha(m) {
+  const w = canvas.width, h = canvas.height;
+  const ch = m.channels || 1;
+  const d = m.data;
+
+  // Seuil dynamique plus bas : capte aussi les zones de mur "faibles"
+  let max = 0;
+  const n = m.width * m.height;
+  for (let p = 0; p < n; p++) { const v = d[p * ch]; if (v > max) max = v; }
+  const thr = max > 1 ? max * 0.4 : 0.4;
+
+  let bin = new Uint8Array(n);
+  for (let p = 0; p < n; p++) bin[p] = d[p * ch] >= thr ? 1 : 0;
+
+  // Mise à l'échelle du masque vers la taille exacte de la photo
+  if (m.width !== w || m.height !== h) {
+    const t = document.createElement('canvas');
+    t.width = m.width; t.height = m.height;
+    const tctx = t.getContext('2d', { willReadFrequently: true });
+    const id = tctx.createImageData(m.width, m.height);
+    for (let p = 0; p < n; p++) {
+      const v = bin[p] * 255;
+      id.data[p * 4] = id.data[p * 4 + 1] = id.data[p * 4 + 2] = v;
+      id.data[p * 4 + 3] = 255;
+    }
+    tctx.putImageData(id, 0, 0);
+    const t2 = document.createElement('canvas');
+    t2.width = w; t2.height = h;
+    const t2ctx = t2.getContext('2d', { willReadFrequently: true });
+    t2ctx.imageSmoothingEnabled = true;
+    t2ctx.drawImage(t, 0, 0, w, h);
+    const sd = t2ctx.getImageData(0, 0, w, h).data;
+    bin = new Uint8Array(w * h);
+    for (let p = 0; p < bin.length; p++) bin[p] = sd[p * 4] > 127 ? 1 : 0;
+  }
+
+  // Fermeture morphologique renforcée : bouche les trous et fusionne les
+  // fragments d'un même mur (sinon le clic ne sélectionne qu'un morceau).
+  bin = morph(bin, w, h, 3, 'di');
+  bin = morph(bin, w, h, 2, 'er');
+
+  // Zones cliquables : chaque mur continu devient une région sélectionnable
+  const regions = labelRegions(bin, w, h);
+  regionMap = regions.map;
+  regionSizes = regions.sizes;
+  wallSelection = null;
+  alphaAll = alphaFromBin(bin);
+  return alphaAll;
+}
+
+// Étiquetage des composantes connexes (voisinage 8) : un id par mur continu
+function labelRegions(bin, w, h) {
+  const map = new Int32Array(w * h);
+  const sizes = [];
+  const stack = [];
+  let id = 0;
+  for (let p = 0; p < bin.length; p++) {
+    if (bin[p] && !map[p]) {
+      id++;
+      let size = 0;
+      map[p] = id;
+      stack.push(p);
+      while (stack.length) {
+        const q = stack.pop();
+        size++;
+        const x = q % w, y = (q / w) | 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= h) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= w) continue;
+            const r = yy * w + xx;
+            if (bin[r] && !map[r]) { map[r] = id; stack.push(r); }
+          }
+        }
+      }
+      sizes.push(size);
+    }
+  }
+  return { map, sizes };
+}
+
+// Double filtre guidé puis transition douce : la peinture s'arrête sur le
+// contour des objets avec un dégradé naturel (pas de coupe dure).
+function alphaFromBin(bin) {
+  const w = canvas.width, h = canvas.height;
+  const guide = grayscaleGuide();
+  let alpha = new Float32Array(w * h);
+  for (let p = 0; p < alpha.length; p++) alpha[p] = bin[p];
+  alpha = guidedFilter(alpha, guide, w, h, 8, 5e-5);
+  alpha = guidedFilter(alpha, guide, w, h, 6, 5e-5);
+  // Transition large et douce entre peint et non-peint (~4 px)
+  for (let p = 0; p < alpha.length; p++) {
+    let t = (alpha[p] - 0.25) / 0.50;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    alpha[p] = t * t * (3 - 2 * t); // smoothstep
+  }
+  alpha = boxBlur(alpha, w, h, 2);
+  for (let p = 0; p < alpha.length; p++) alpha[p] = Math.min(1, Math.max(0, alpha[p]));
+  return alpha;
+}
+
+// Niveaux de gris [0..1] de la photo originale, servant de guide au filtre
+let guideCache = null;
+function grayscaleGuide() {
+  const n = canvas.width * canvas.height;
+  if (guideCache && guideCache.length === n) return guideCache;
+  const src = baseImageData.data;
+  const g = new Float32Array(n);
+  for (let p = 0; p < n; p++) {
+    const i = p * 4;
+    g[p] = (0.299 * src[i] + 0.587 * src[i + 1] + 0.114 * src[i + 2]) / 255;
+  }
+  guideCache = g;
+  return g;
+}
+
+// Filtre guidé (He et al.) : lissage qui respecte les contours de l'image guide
+function guidedFilter(p, I, w, h, r, eps) {
+  const B = x => boxBlur(x, w, h, r);
+  const n = p.length;
+  const mul = (x, y) => { const o = new Float32Array(n); for (let q = 0; q < n; q++) o[q] = x[q] * y[q]; return o; };
+  const sub = (x, y) => { const o = new Float32Array(n); for (let q = 0; q < n; q++) o[q] = x[q] - y[q]; return o; };
+  const meanI = B(I), meanP = B(p);
+  const covIp = sub(B(mul(I, p)), mul(meanI, meanP));
+  const varI = sub(B(mul(I, I)), mul(meanI, meanI));
+  const a = new Float32Array(n), b = new Float32Array(n);
+  for (let q = 0; q < n; q++) {
+    a[q] = covIp[q] / (varI[q] + eps);
+    b[q] = meanP[q] - a[q] * meanI[q];
+  }
+  const meanA = B(a), meanB = B(b);
+  const o = new Float32Array(n);
+  for (let q = 0; q < n; q++) o[q] = meanA[q] * I[q] + meanB[q];
+  return o;
+}
+
+// Morphologie binaire (dilate/érode, voisinage 8) pour nettoyer le masque
+function morph(bin, w, h, iter, mode) {
+  let cur = bin;
+  for (let k = 0; k < iter; k++) {
+    const nx = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const p = y * w + x;
+        let v = mode === 'er' ? 1 : 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= h) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= w) continue;
+            const q = cur[yy * w + xx];
+            if (mode === 'er') { if (!q) v = 0; } else if (q) v = 1;
+          }
+        }
+        nx[p] = v;
+      }
+    }
+    cur = nx;
+  }
+  return cur;
+}
+
+// Flou boîte séparable (glissant) — appliqué 2x, il approche un flou gaussien
+function boxBlur(a, w, h, r) {
+  const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+  const div = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    let s = 0;
+    for (let x = -r; x <= r; x++) s += a[y * w + Math.min(w - 1, Math.max(0, x))];
+    for (let x = 0; x < w; x++) {
+      tmp[y * w + x] = s / div;
+      s += a[y * w + Math.min(w - 1, Math.max(0, x + r + 1))]
+         - a[y * w + Math.min(w - 1, Math.max(0, x - r))];
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (let y = -r; y <= r; y++) s += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = s / div;
+      s += tmp[Math.min(h - 1, Math.max(0, y + r + 1)) * w + x]
+         - tmp[Math.min(h - 1, Math.max(0, y - r)) * w + x];
+    }
+  }
+  return out;
+}
+
+// Charge le modele demande (version quantifiee), avec reessai et repli
+// automatique sur un modele plus leger si le telechargement echoue.
+async function getSegmenter() {
+  if (segmenters[quality]) return segmenters[quality];
+  let q = quality;
+  while (q) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        segmenters[q] = await pipeline('image-segmentation', MODELS[q], { dtype: 'q8' });
+        if (q !== quality) {
+          quality = q;
+          $('#quality').value = q;
+        }
+        return segmenters[q];
+      } catch (e) {
+        console.error(e);
+        if (attempt === 1) break;
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+    q = MODEL_FALLBACK[q];
+    if (q) setStatus('Model unavailable, trying a lighter one...', 'warn');
+  }
+  throw new Error('Telechargement du modele impossible - verifiez votre connexion internet et rechargez la page.');
+}
+
+// ---- Application de la couleur : colorisation LAB comme un vrai simulateur de peinture ----
+// On conserve la luminance (texture, ombres, reliefs) du mur et on remplace
+// uniquement la teinte/saturation par celle de la peinture choisie.
+function applyColor() {
+  if (!baseImageData || !wallMask || !selectedColor) return;
+  const src = baseImageData.data;
+  const out = new ImageData(new Uint8ClampedArray(src), baseImageData.width, baseImageData.height);
+  const d = out.data;
+  const [rC, gC, bC] = hexToRgb(selectedColor);
+  const [Lc, ac, bc] = pixToLab(rC, gC, bC);
+  const strength = parseFloat(strengthSlider.value);
+
+  // Luminance LAB moyenne du mur (pondérée par l'alpha du masque)
+  let sumL = 0, count = 0;
+  for (let p = 0; p < wallMask.length; p++) {
+    const wgt = wallMask[p];
+    if (wgt > 0) {
+      const i = p * 4;
+      sumL += pixToLab(src[i], src[i + 1], src[i + 2])[0] * wgt;
+      count += wgt;
+    }
+  }
+  const avgL = count > 0 ? sumL / count : Lc;
+  const dL = (Lc - avgL) * 0.85; // décale la luminosité générale vers celle de la peinture
+
+  for (let p = 0; p < wallMask.length; p++) {
+    const wgt = wallMask[p];
+    if (!wgt) continue;
+    const t = strength * wgt;
+    const i = p * 4;
+    const [L0] = pixToLab(src[i], src[i + 1], src[i + 2]);
+    // Texture préservée : L local (relief du mur) + décalage global de luminosité
+    const L1 = Math.min(97, Math.max(3, L0 + dL));
+    // Désaturation douce dans les ombres profondes et les reflets brillants (rolloff)
+    const roll = Math.min(1, Math.min(L1, 100 - L1) / 12);
+    const rgb = labToPix(L1, ac * roll, bc * roll);
+    d[i]     = src[i]     + (rgb[0] - src[i])     * t;
+    d[i + 1] = src[i + 1] + (rgb[1] - src[i + 1]) * t;
+    d[i + 2] = src[i + 2] + (rgb[2] - src[i + 2]) * t;
+  }
+  coloredImageData = out;
+  if (!maskView) ctx.putImageData(out, 0, 0);
+  baWrap.hidden = false; // active le curseur Avant / Après
+}
+
+// ---- Vue diagnostic : affiche le masque détecté en rouge ----
+let maskView = false;
+$('maskBtn').addEventListener('click', () => {
+  if (!baseImageData) return;
+  maskView = !maskView;
+  $('maskBtn').classList.toggle('active', maskView);
+  renderView();
+});
+
+function renderView() {
+  if (!baseImageData) return;
+  if (maskView && wallMask) {
+    const out = new ImageData(new Uint8ClampedArray(baseImageData.data), baseImageData.width, baseImageData.height);
+    const d = out.data;
+    for (let p = 0; p < wallMask.length; p++) {
+      const i = p * 4, a = wallMask[p];
+      d[i]     = d[i]     * (1 - a) + (d[i] * 0.35 + 255 * 0.65) * a;
+      d[i + 1] = d[i + 1] * (1 - a) + d[i + 1] * 0.35 * a;
+      d[i + 2] = d[i + 2] * (1 - a) + d[i + 2] * 0.35 * a;
+    }
+    ctx.putImageData(out, 0, 0);
+  } else if (coloredImageData) {
+    ctx.putImageData(coloredImageData, 0, 0);
+  } else {
+    ctx.putImageData(baseImageData, 0, 0);
+  }
+}
+
+// ---- Conversions sRGB <-> CIELAB (D65) ----
+function srgbToLin(c) {
+  c /= 255;
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+function linToSrgb(c) {
+  c = Math.min(1, Math.max(0, c));
+  return (c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055) * 255;
+}
+function labF(t) { return t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116; }
+function labFinv(t) { const t3 = t * t * t; return t3 > 0.008856 ? t3 : (t - 16 / 116) / 7.787; }
+function pixToLab(r, g, b) {
+  const R = srgbToLin(r), G = srgbToLin(g), B = srgbToLin(b);
+  const fx = labF((R * 0.4124564 + G * 0.3575761 + B * 0.1804375) / 0.95047);
+  const fy = labF(R * 0.2126729 + G * 0.7151522 + B * 0.0721750);
+  const fz = labF((R * 0.0193339 + G * 0.1191920 + B * 0.9503041) / 1.08883);
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+}
+function labToPix(L, a, b) {
+  const fy = (L + 16) / 116, fx = fy + a / 500, fz = fy - b / 200;
+  const X = 0.95047 * labFinv(fx), Y = labFinv(fy), Z = 1.08883 * labFinv(fz);
+  return [
+    linToSrgb(X *  3.2404542 + Y * -1.5371385 + Z * -0.4985314),
+    linToSrgb(X * -0.9692660 + Y *  1.8760108 + Z *  0.0415560),
+    linToSrgb(X *  0.0556434 + Y * -0.2040259 + Z *  1.0572252)
+  ];
+}
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+const clamp = v => v < 0 ? 0 : v > 255 ? 255 : v;
+</script>
+<style>
+:root {
+  --bg: #0b0b0e; --bg2: #0f1016; --panel: #111118; --panel2: #16161f;
+  --border: rgba(125,165,255,.16); --border-strong: rgba(125,165,255,.28);
+  --accent: #5aa0ff; --accent2: #8fbaff;
+  --grad: linear-gradient(135deg, #5aa0ff, #3266e8);
+  --text: #eef0f6; --muted: #94a0b4;
+  --ok: #5ee6a8; --warn: #ffc46b; --err: #ff7a7a;
+  --r: 14px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { min-height: 100%; }
+body {
+  font-family: 'Space Grotesk', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  color: var(--text);
+  min-height: 100vh; padding: 16px 14px 40px;
+  display: flex; flex-direction: column; align-items: center;
+  background:
+    radial-gradient(1100px 560px at 85% -15%, rgba(38,84,190,.28), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(22,60,150,.20), transparent 55%),
+    linear-gradient(162deg, #12193a 0%, #0b0b0e 52%, #0a0d1c 100%),
+    var(--bg);
+  background-attachment: fixed;
+}
+
+/* ---- Filigrane SATIN DECO (discret, derrière l'app) ---- */
+#bgWatermark {
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  height: 420px; width: auto; opacity: .05;
+  z-index: -1; pointer-events: none; user-select: none;
+}
+
+/* ---- Header fin : BLANLUX + SATIN DECO à gauche, WallColor à droite ---- */
+header { width: min(97vw, 1400px); margin-bottom: 14px; }
+.brand-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 16px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--r);
+}
+.brand-logos { display: flex; align-items: center; gap: 10px; }
+.brand-logos #blanluxLogo { height: 42px; width: auto; }
+.brand-mid { display: none; align-items: center; }
+.brand-mid #packLogo { height: 44px; width: auto; }
+.brand-right { display: flex; align-items: center; gap: 12px; }
+.brand-right #wcLogo { height: 36px; width: auto; }
+.badge-local {
+  font-size: 11px; font-weight: 600; color: var(--text);
+  background: var(--panel2); border: 1px solid var(--border);
+  padding: 4px 10px; border-radius: 999px;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.badge-local .lk { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; }
+.sub { max-width: 720px; margin: 8px auto 0; color: var(--muted); font-size: 13px; text-align: center; line-height: 1.55; }
+
+/* ---- Appareil photo intégré ---- */
+#camModal {
+  position: fixed; inset: 0; z-index: 100; background: rgba(5,6,10,.96);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px;
+}
+#camModal[hidden] { display: none !important; }
+#camVideo {
+  max-width: 94vw; max-height: 74vh; border-radius: 14px;
+  background: #000; border: 1px solid var(--border); box-shadow: 0 14px 50px rgba(0,0,0,.6);
+}
+.cam-bar { display: flex; gap: 14px; }
+
+/* ---- Boutons ---- */
+.btn {
+  border: none; padding: 11px 20px; border-radius: 10px; font-weight: 700; font-size: 14px;
+  cursor: pointer; transition: .15s; color: #fff; background: var(--grad);
+  font-family: inherit;
+}
+.btn:hover { filter: brightness(1.08); }
+.btn.ghost { background: var(--panel2); border: 1px solid var(--border); box-shadow: none; color: var(--text); }
+.btn.ghost:hover { background: #1d2436; }
+.btn.active { outline: 2px solid var(--accent2); }
+
+/* ---- Zone de dépôt ---- */
+#dropzone {
+  width: min(94vw, 720px); padding: 40px 24px;
+  border: 2px dashed var(--border-strong); border-radius: 16px;
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  cursor: pointer; transition: .2s; background: var(--bg2);
+}
+#centerPanel #dropzone { width: 100%; max-width: none; min-height: 400px; justify-content: center; margin: 0; }
+#dropzone.drag, #dropzone:hover { border-color: var(--accent); background: rgba(90,160,255,.08); }
+#dropzone .big { font-size: 3rem; }
+#dropzone p { color: var(--muted); font-size: 14px; }
+#dropzone p strong { color: var(--text); }
+.btns { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+
+/* ---- Barre du studio (au-dessus du canvas) : titre + actions ---- */
+.cv-bar {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 12px;
+  padding: 8px 14px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r); margin-bottom: 10px;
+}
+.cv-bar .toolbar-group { margin-left: auto; flex-wrap: nowrap; }
+.cv-title {
+  font-size: 12px; font-weight: 700; color: var(--text);
+  display: flex; align-items: center; gap: 8px;
+}
+.cv-title::before {
+  content: ''; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--grad); box-shadow: 0 0 10px rgba(90,160,255,.7);
+}
+.cv-badge {
+  font-size: 11px; font-weight: 600; color: var(--muted);
+  background: var(--panel2); border: 1px solid var(--border);
+  padding: 4px 10px; border-radius: 999px; white-space: nowrap;
+}
+
+/* ---- Actions de la bannière Studio (style Stitch) ---- */
+.toolbar-group {
+  display: flex; align-items: center; gap: 4px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--r); padding: 4px;
+}
+.toolbar-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--panel2); border: 1px solid transparent; color: var(--text);
+  border-radius: 8px; padding: 7px 12px; font-size: 12px; font-weight: 600;
+  cursor: pointer; transition: .15s; font-family: inherit;
+}
+.toolbar-btn:hover { background: #1d2436; }
+.toolbar-btn .tb-icon { font-size: 14px; }
+.seg-btn {
+  background: transparent; border: 1px solid transparent;
+  color: var(--muted); border-radius: 7px; padding: 6px 14px;
+  font-size: 12px; font-weight: 600; cursor: pointer; transition: .15s; font-family: inherit;
+}
+.seg-btn:hover { color: var(--text); }
+.seg-btn.active {
+  background: rgba(90,160,255,.16); border-color: var(--accent); color: #fff;
+}
+body.mobile .toolbar-btn { flex: 0 0 auto; white-space: nowrap; }
+
+/* ---- Bottom nav mobile (style Stitch) ---- */
+.bottom-nav {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 90;
+  background: var(--panel); border-top: 1px solid var(--border);
+  display: none; grid-template-columns: repeat(4, 1fr); gap: 6px;
+  padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+}
+.bottom-item {
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  background: var(--panel2); border: 1px solid var(--border); color: var(--muted);
+  font-size: 10px; font-weight: 600; padding: 7px 2px; border-radius: 10px;
+  cursor: pointer; transition: .15s; font-family: inherit;
+}
+.bottom-item .bottom-icon { font-size: 15px; line-height: 1; }
+.bottom-item.active { color: #fff; background: rgba(90,160,255,.16); border-color: var(--accent); }
+body.phone .bottom-nav { display: grid; }
+body.phone { padding-bottom: calc(100px + env(safe-area-inset-bottom)); }
+
+/* ---- Espace de travail : outils à gauche, photo au centre, couleurs à droite ---- */
+#app {
+  display: grid; width: min(97vw, 1400px); margin: 0 auto;
+  grid-template-columns: 258px minmax(0, 1fr) 246px;
+  align-items: stretch; background: rgba(13,14,22,.78);
+  border: 1px solid var(--border); border-radius: var(--r); overflow: hidden;
+}
+#leftPanel, #rightPanel {
+  background: var(--panel);
+  display: flex; flex-direction: column; gap: 0; padding: 16px 14px;
+}
+#leftPanel { border-right: 1px solid var(--border); }
+#rightPanel { border-left: 1px solid var(--border); }
+
+/* Sections regroupées de la sidebar (Outils / Rendu / Affiner) */
+.st-sec { display: flex; flex-direction: column; gap: 10px; margin-bottom: 18px; }
+.st-sec:last-child { margin-bottom: 0; }
+/* Desktop (non mobile) : tout le panneau Outils défile comme le nuancier droit */
+body:not(.mobile) #leftPanel .st-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-right: 6px; scrollbar-gutter: stable; }
+body:not(.mobile) #leftPanel .st-scroll .toolgrid { gap: 10px; }
+body:not(.mobile) #leftPanel .st-scroll .toolgrid .tbtn { padding: 16px 6px; gap: 7px; font-size: 11px; }
+body:not(.mobile) #leftPanel .st-scroll .toolgrid .tbtn .ico { font-size: 20px; }
+/* Barres de défilement strictement identiques : nuancier (droite) et outils (gauche) */
+body:not(.mobile) #rightPanel #palette, body:not(.mobile) #leftPanel .st-scroll { scrollbar-width: thin; scrollbar-color: var(--border-strong) var(--bg2); }
+body:not(.mobile) #rightPanel #palette::-webkit-scrollbar, body:not(.mobile) #leftPanel .st-scroll::-webkit-scrollbar { width: 8px; }
+body:not(.mobile) #rightPanel #palette::-webkit-scrollbar-track, body:not(.mobile) #leftPanel .st-scroll::-webkit-scrollbar-track { background: var(--bg2); border-radius: 8px; }
+body:not(.mobile) #rightPanel #palette::-webkit-scrollbar-thumb, body:not(.mobile) #leftPanel .st-scroll::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 8px; }
+body:not(.mobile) #rightPanel #palette::-webkit-scrollbar-thumb:hover, body:not(.mobile) #leftPanel .st-scroll::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+.ptitle {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
+  font-weight: 700; color: var(--muted);
+  display: flex; justify-content: space-between; align-items: baseline;
+}
+.ptitle .count { font-size: 11px; color: var(--accent2); text-transform: none; letter-spacing: 0; }
+.toolgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.tbtn {
+  display: flex; flex-direction: column; align-items: center; gap: 5px;
+  padding: 10px 4px; border-radius: 10px; background: var(--panel2);
+  border: 1px solid var(--border); color: var(--text); cursor: pointer;
+  font-size: 10px; font-weight: 600; transition: .15s; text-align: center;
+  font-family: inherit; line-height: 1.15;
+}
+.tbtn .ico { font-size: 15px; }
+.tbtn:hover { background: #1d2436; }
+.tbtn.active { border-color: var(--accent); background: rgba(90,160,255,.14); box-shadow: inset 0 0 0 1px var(--accent); }
+.st-resetbtn { width: 100%; flex-direction: row; justify-content: center; gap: 7px; font-size: 11px; color: var(--muted); }
+/* Actions finales : boutons côte à côte en bas (alignés comme la grille du nuancier) */
+.st-actions { margin-top: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.st-actions > * { width: 100%; margin: 0; }
+
+/* Champ slider de la sidebar (taille du pinceau) */
+.st-field {
+  display: flex; flex-direction: column; gap: 6px;
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px;
+}
+.st-field label { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+.st-field label em { font-style: normal; color: var(--accent2); font-weight: 700; }
+#leftPanel select, #leftPanel input[type=range] { width: 100%; }
+
+/* Rendu + Affiner */
+.render-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.refine-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.slider-box {
+  display: flex; flex-direction: column; gap: 6px;
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px;
+}
+.slider-box label { font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; align-items: baseline; }
+.refine-row .slider-box:last-child { grid-column: 1 / -1; }
+.slider-box label b, .slider-box label span { color: var(--accent2); font-weight: 700; }
+select {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 8px; font-size: 13px; cursor: pointer; font-family: inherit;
+}
+input[type=range] { accent-color: var(--accent); width: 100%; }
+
+/* Centre */
+#centerPanel { min-width: 0; display: flex; flex-direction: column; padding: 14px; }
+.frame {
+  border-radius: 12px; overflow: hidden; border: 1px solid var(--border);
+  background: #05050a; box-shadow: 0 14px 40px rgba(0,0,0,.4); position: relative;
+  display: flex; justify-content: center; align-items: center; padding: 6px;
+}
+#canvasBox { position: relative; display: block; max-width: 100%; }
+#canvas {
+  display: block; width: auto; height: auto;
+  max-width: 100%; max-height: calc(100vh - 260px);
+  max-height: calc(100dvh - 260px);
+}
+
+/* ---- Curseur Avant / Après ---- */
+#baWrap { position: absolute; inset: 0; pointer-events: none; }
+#origCanvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+#baBar {
+  position: absolute; top: 0; bottom: 0; width: 36px; transform: translateX(-50%);
+  pointer-events: auto; cursor: grab; display: flex; align-items: center;
+  justify-content: center; touch-action: none;
+}
+#baBar:active { cursor: grabbing; }
+#baBar::before {
+  content: ''; position: absolute; top: 0; bottom: 0; left: 50%; width: 2px;
+  background: #fff; box-shadow: 0 0 6px rgba(0,0,0,.65);
+}
+.ba-grip {
+  width: 40px; height: 40px; border-radius: 50%; background: rgba(10,10,15,.8);
+  border: 2px solid #fff; display: grid; place-items: center; font-size: 15px;
+  color: #fff; box-shadow: 0 4px 14px rgba(0,0,0,.45);
+}
+.ba-tag {
+  position: absolute; top: 12px; padding: 4px 12px; border-radius: 999px;
+  font-size: 11px; font-weight: 700; letter-spacing: .04em;
+  background: rgba(0,0,0,.6); border: 1px solid rgba(255,255,255,.2); color: #fff;
+}
+.tag-l { left: 12px; } .tag-r { right: 12px; }
+
+/* ---- Badge du nom de couleur en haut de la photo ---- */
+#colorBadge {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; justify-content: center; gap: 7px;
+  max-width: calc(100% - 24px); padding: 5px 13px; border-radius: 999px;
+  background: rgba(0,0,0,.62); border: 1px solid rgba(255,255,255,.18);
+  color: #fff; font-size: 11px; font-weight: 700; letter-spacing: .04em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  box-shadow: 0 4px 14px rgba(0,0,0,.35); z-index: 6; pointer-events: none;
+}
+#colorBadge[hidden] { display: none; }
+#colorBadge .dot { width: 13px; height: 13px; border-radius: 50%; flex-shrink: 0; border: 2px solid rgba(255,255,255,.45); }
+#colorBadge code { color: #a9cdff; font-size: 10px; font-weight: 600; }
+
+/* ---- Outils de retouche du masque ---- */
+#brushCursor {
+  position: absolute; border: 2px solid #fff; border-radius: 50%;
+  pointer-events: none; transform: translate(-50%, -50%); display: none;
+  box-shadow: 0 0 0 1px rgba(0,0,0,.55), inset 0 0 0 1px rgba(0,0,0,.55);
+  z-index: 5; width: 34px; height: 34px;
+}
+#brushCursor.erase { border-color: var(--err); }
+#brushCursor.refine { border-color: var(--accent2); }
+
+/* ---- Contrôles et statut ---- */
+.status { margin: 0 auto 10px; font-size: 13px; text-align: center; min-height: 1.2em; color: var(--muted); max-width: 720px; width: 100%; }
+.status.ok { color: var(--ok); } .status.err { color: var(--err); } .status.warn { color: var(--warn); } .status.info { color: var(--accent2); }
+
+/* ---- Barre de progression 1-100 % (analyse IA) ---- */
+.prog-pill {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; max-width: 720px; margin: 0 auto 10px;
+}
+.prog-pill[hidden] { display: none; }
+.prog-wrap {
+  flex: 1; height: 7px;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 999px;
+  overflow: hidden; box-shadow: inset 0 1px 3px rgba(0,0,0,.4);
+}
+.prog-bar { height: 100%; width: 0%; background: var(--grad); border-radius: 999px; transition: width .18s ease; }
+.prog-pct { font-size: 12px; font-weight: 700; color: var(--accent2); min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---- Panneau de droite : nuancier catalogue ---- */
+#rightPanel #satinLogo { display: block; height: 44px; width: auto; margin: 0 auto 8px; }
+#rightPanel #palette {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;
+  overflow-y: auto; padding-right: 4px; padding-bottom: 6px;
+}
+body:not(.mobile) #rightPanel #palette { flex: 1 1 0; min-height: 0; }
+.swatch-item {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 10px 6px 9px; border-radius: 10px;
+  background: var(--panel2); border: 1px solid var(--border); cursor: pointer;
+  transition: .15s; color: var(--text); text-align: center; font-family: inherit;
+}
+.swatch-item:hover { background: #1d2436; }
+.swatch-item.selected { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(90,160,255,.35); }
+.swatch-item .sq {
+  width: 42px; height: 42px; border-radius: 9px; flex-shrink: 0;
+  border: 1px solid rgba(0,0,0,.3); box-shadow: inset 0 0 0 1px rgba(255,255,255,.12);
+}
+.swatch-item .nm { font-size: 11px; font-weight: 700; line-height: 1.3; letter-spacing: .01em; }
+.swatch-item .nm small { display: block; color: var(--muted); font-weight: 400; font-size: 10px; font-family: var(--mono); }
+
+/* ---- Indicateur de couleur sélectionnée ---- */
+#colorName {
+  margin-top: 8px; text-align: center; font-weight: 600; color: var(--text);
+  display: flex; align-items: center; justify-content: center; gap: 8px; flex-wrap: wrap;
+  font-size: 13px;
+}
+#colorName .dot { width: 15px; height: 15px; border-radius: 50%; display: inline-block; border: 2px solid rgba(255,255,255,.4); }
+#colorName code { color: var(--accent2); font-size: 11px; }
+
+footer {
+  margin-top: 26px; color: var(--muted); font-size: 12px; text-align: center;
+  display: flex; align-items: center; justify-content: center; gap: 8px; flex-wrap: wrap;
+}
+footer #blanluxFooter { height: 16px; width: auto; opacity: .75; }
+
+/* ---- Mobile : panneaux empilés + glissières horizontales (JS body.mobile) ---- */
+body.mobile #app { grid-template-columns: minmax(0, 1fr); }
+body.mobile #leftPanel { border-right: none; border-bottom: 1px solid var(--border); }
+body.mobile #rightPanel { border-left: none; border-top: 1px solid var(--border); }
+body.mobile #centerPanel { order: -1; }
+body.mobile #leftPanel { order: 0; }
+body.mobile #rightPanel { order: 1; }
+body.mobile .toolgrid, body.mobile .render-row, body.mobile .refine-row {
+  display: flex; flex-direction: row; min-width: 0; overflow-x: auto;
+  justify-content: flex-start; gap: 9px; padding-bottom: 8px;
+  scroll-snap-type: x proximity; -webkit-overflow-scrolling: touch;
+  touch-action: pan-x; overscroll-behavior: contain;
+}
+body.mobile .toolgrid .tbtn, body.mobile .render-row .slider-box, body.mobile .refine-row .slider-box {
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+body.mobile .toolgrid::-webkit-scrollbar, body.mobile .render-row::-webkit-scrollbar, body.mobile .refine-row::-webkit-scrollbar { height: 4px; }
+body.mobile .toolgrid::-webkit-scrollbar-thumb, body.mobile .render-row::-webkit-scrollbar-thumb, body.mobile .refine-row::-webkit-scrollbar-thumb { background: rgba(255,255,255,.22); border-radius: 4px; }
+body.mobile .tbtn { flex: 0 0 auto; min-width: 88px; scroll-snap-align: start; }
+body.mobile .render-row .slider-box { flex: 0 0 auto; width: 200px; scroll-snap-align: start; }
+body.mobile #leftPanel select, body.mobile #leftPanel input[type=range] { width: 100%; }
+body.mobile #leftPanel .st-scroll { flex: none; overflow: visible; padding-right: 0; scrollbar-gutter: auto; }
+body.mobile #palette { grid-template-columns: repeat(3, 1fr); max-height: none; }
+
+/* ---- Téléphone : nuancier en glissière, marges compactes ---- */
+body.phone .render-row, body.phone .refine-row { display: flex; flex-direction: column; gap: 10px; }
+body.phone #rightPanel #satinLogo { display: none; }
+body.phone #palette {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 7px; max-height: none; overflow: visible;
+}
+body.phone #palette .swatch-item { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+body.phone .swatch-item { width: auto; padding: 8px 6px; }
+body.phone .swatch-item .sq { width: 100%; height: 40px; border-radius: 7px; }
+body.phone .swatch-item .nm { font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body.phone .swatch-item .nm small { display: none; }
+
+/* Outils phone : grille compacte 4 colonnes (comme l'aperçu validé) */
+body.phone .toolgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; overflow: visible; padding-bottom: 0; scroll-snap-type: none; touch-action: auto; }
+body.phone .toolgrid .tbtn { min-width: 0; flex: none; padding: 8px 2px; font-size: 9px; gap: 3px; scroll-snap-align: none; }
+body.phone .toolgrid .tbtn .ico { font-size: 14px; }
+body.phone .st-actions { grid-template-columns: 1fr; }
+body.phone #downloadBtn { width: 100%; margin-top: 0; }
+body.phone { padding: 10px 8px 100px; overflow-x: hidden; }
+body.phone header { margin-bottom: 8px; }
+body.phone .brand-bar { padding: 10px 0 8px; margin: 0 10px; border-bottom: 1px solid var(--border); }
+body.phone .brand-logos #blanluxLogo { height: 30px; }
+body.phone .brand-mid { display: flex; justify-content: center; flex: 1; min-width: 0; }
+body.phone .brand-mid #packLogo { height: 44px; width: auto; }
+body.phone .brand-right { gap: 4px; }
+body.phone .brand-right #wcLogo { height: 32px; margin-right: 2px; }
+@media (max-width: 360px) {
+  body.phone .brand-logos #blanluxLogo { height: 26px; }
+  body.phone .brand-mid #packLogo { height: 36px; }
+  body.phone .brand-right #wcLogo { height: 26px; }
+}
+body.phone .badge-local { display: none; }
+body.phone .sub { font-size: 11px; max-width: 100%; }
+body.phone #canvas { max-height: calc(100dvh / 4); }
+/* Portrait 9:16 : zone image ~3/4 de l'interface (photo verticale, centrée,
+   proportionnelle, sans dépassement ni crop), outils/nuancier ~1/4 dessous
+   séparés par un trait net. Pas d'épingle : le nuancier garde tout l'écran. */
+body.phone.ratio-port #centerPanel { position: static; border-bottom: 1px solid var(--border); }
+body.phone.ratio-port #canvas { max-height: calc(100dvh * 0.58); }
+body.phone.ratio-port #canvasBox { max-width: calc(100% - 8px); }
+/* Portrait : la barre du studio reste sur une seule ligne (défilement horizontal)
+   pour céder la hauteur à la photo — zone image ~3/4, outils ~1/4 */
+body.phone.ratio-port .cv-bar { flex-wrap: nowrap; }
+body.phone.ratio-port .cv-bar .toolbar-group { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+body.phone.ratio-port .cv-bar .toolbar-group::-webkit-scrollbar { display: none; }
+/* Phone : la photo reste collée en haut pendant le défilement des outils et du nuancier (type YouTube) */
+body.phone #app { overflow: visible; }
+body.phone #centerPanel { position: sticky; top: 0; z-index: 5; background: var(--bg); padding-bottom: 8px; }
+body.phone #canvasBox { width: fit-content; margin: 0 auto; }
+body.phone .cv-bar { gap: 8px; padding: 8px 10px; }
+body.phone .cv-bar .toolbar-group { margin-left: auto; }
+body.phone .frame { padding: 4px; border-radius: 10px; }
+body.phone #centerPanel { padding: 8px 6px; }
+body.phone #leftPanel, body.phone #rightPanel { padding: 10px 9px; gap: 8px; }
+body.phone select, body.phone input[type=range] { font-size: 16px; }
+body.phone .tbtn { min-width: 74px; padding: 8px 4px; }
+
+/* ---- Phone : pas de zone de dépôt, canvas vide avec boutons ---- */
+body.phone #dropzone { display: none !important; }
+.empty-state { display: none; }
+body.phone .frame.empty { justify-content: center; min-height: 320px; }
+body.phone .frame.empty .empty-state { display: flex; flex-direction: column; align-items: center; gap: 14px; text-align: center; padding: 20px; }
+body.phone .frame.empty .empty-state .big { font-size: 2.6rem; }
+body.phone .frame.empty .empty-state p { color: var(--muted); font-size: 13px; max-width: 260px; line-height: 1.5; }
+body.phone .frame.empty .empty-state p strong { color: var(--text); }
+body.phone .frame.empty #canvasBox { display: none; }
+body.phone .frame.empty .btns .btn { font-size: 13px; padding: 10px 16px; }
+@media (max-width: 560px) {
+  .toolgrid { grid-template-columns: repeat(2, 1fr); }
+  #palette { grid-template-columns: 1fr 1fr; }
+}
+</style>
+</head>
+<body>
+<img id="bgWatermark" src="logo-satin-deco.png" alt="" aria-hidden="true">
+<header>
+  <div class="brand-bar">
+    <div class="brand-logos">
+      <img id="blanluxLogo" src="logo-blanlux.png" alt="BLANLUX">
+    </div>
+    <div class="brand-mid"><img id="packLogo" src="logo-satin-deco.png" alt="Packaging SATIN DECO"></div>
+    <div class="brand-right">
+      <span class="badge-local"><span class="lk"></span>100% local</span>
+      <img id="wcLogo" src="logo-wallcolor.png" alt="WallColor Paint">
+    </div>
+  </div>
+  <p class="sub">Photographiez ou uploadez votre pièce — l'IA détecte les murs et applique la teinte SATIN DECO choisie, sans toucher aux meubles ni à la décoration.</p>
+</header>
+
+<input type="file" id="fileInput" accept="image/*" hidden>
+<input type="file" id="cameraInput" accept="image/*" capture="environment" hidden>
+
+<div id="app">
+  <aside id="leftPanel">
+    <div class="st-scroll">
+    <section class="st-sec">
+      <h2 class="ptitle">Outils <span class="count">8 outils</span></h2>
+      <div class="toolgrid">
+        <button class="tbtn" id="resetBtn" title="Charger une autre photo"><span class="ico">🔄</span>Nouvelle photo</button>
+        <button class="tbtn active" id="selectBtn" title="Cliquer sur un mur pour ne peindre que lui"><span class="ico">✋</span>Sélection</button>
+        <button class="tbtn" id="brushBtn" title="Sélection rapide : ajoute des zones au masque en épousant les contours"><span class="ico">🖌</span>Ajouter</button>
+        <button class="tbtn" id="eraserBtn" title="Effacer la peinture sur les meubles / objets"><span class="ico">🧽</span>Effacer</button>
+        <button class="tbtn" id="refineBtn" title="Pinceau Contour : colle le bord du masque aux objets"><span class="ico">🪶</span>Contour</button>
+        <button class="tbtn" id="undoBtn" title="Annuler la dernière retouche"><span class="ico">↩</span>Annuler</button>
+        <button class="tbtn" id="clearEditsBtn" title="Supprimer toutes les retouches manuelles"><span class="ico">♻️</span>Effacer retouches</button>
+        <button class="tbtn" id="maskBtn" title="Afficher le masque détecté"><span class="ico">👁</span>Masque</button>
+      </div>
+      <div class="st-field" id="brushBox" style="display:none">
+        <label class="st-label">Taille du pinceau</label>
+        <input type="range" id="brushSize" min="6" max="120" value="34">
+        <span id="brushSizeVal">34</span>
+      </div>
+    </section>
+
+    <section class="st-sec">
+      <h2 class="ptitle">Rendu</h2>
+      <div class="render-row">
+        <div class="slider-box">
+          <label>Qualité IA</label>
+          <select id="quality">
+            <option value="b0">Rapide</option>
+            <option value="b2">Précise</option>
+            <option value="b3" selected>Maximale</option>
+          </select>
+        </div>
+        <div class="slider-box">
+          <label>Intensité <span id="strengthVal">90%</span></label>
+          <input type="range" id="strength" min="0.3" max="1" step="0.05" value="0.9">
+        </div>
+      </div>
+    </section>
+
+    <section class="st-sec" id="refinePanel" style="display:none">
+      <h2 class="ptitle">Affiner le masque</h2>
+      <div class="refine-row">
+        <div class="slider-box"><label>Lissage <span id="rSmoothV">0</span></label><input type="range" id="rSmooth" min="0" max="100" value="0"></div>
+        <div class="slider-box"><label>Contour <span id="rFeatherV">0</span></label><input type="range" id="rFeather" min="0" max="100" value="0"></div>
+        <div class="slider-box"><label>Contraste <span id="rContrastV">0</span></label><input type="range" id="rContrast" min="0" max="100" value="0"></div>
+        <div class="slider-box"><label>Décalage <span id="rShiftV">0</span></label><input type="range" id="rShift" min="-100" max="100" value="0"></div>
+        <div class="slider-box"><label>Dureté <span id="rHardV">0</span></label><input type="range" id="rHard" min="0" max="100" value="0"></div>
+      </div>
+    </section>
+
+    </div>
+    <div class="st-actions">
+      <button class="tbtn st-resetbtn" id="refineResetBtn" style="display:none"><span class="ico">♻️</span>Réinitialiser l'affinage</button>
+      <button class="btn st-download" id="downloadBtn">⬇️ Télécharger le résultat</button>
+    </div>
+  </aside>
+
+  <main id="centerPanel">
+    <div class="cv-bar">
+      <span class="cv-title">Studio de visualisation</span>
+      <span class="cv-badge">🔒 100% local</span>
+      <div class="toolbar-group">
+        <button class="toolbar-btn" id="tbUpload" title="Uploader une image">
+          <span class="tb-icon">📤</span><span>Upload Photo</span>
+        </button>
+        <button class="toolbar-btn hide-sm" id="tbCapture" title="Prendre une photo">
+          <span class="tb-icon">📷</span><span>Capture</span>
+        </button>
+        <button class="seg-btn active" id="tbBA" title="Afficher/masquer le curseur Avant / Après">
+          Avant/Après
+        </button>
+      </div>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="prog-pill" id="segProgress" hidden>
+      <div class="prog-wrap"><div class="prog-bar" id="segBar"></div></div>
+      <span class="prog-pct" id="segPct">0%</span>
+    </div>
+    <div id="dropzone">
+      <div class="big">📸</div>
+      <p><strong>Glissez une photo ici</strong> ou choisissez :</p>
+      <div class="btns">
+        <button class="btn" id="takePhotoBtn">📷 Prendre une photo</button>
+        <button class="btn ghost" onclick="document.getElementById('fileInput').click()">📁 Uploader une image</button>
+        <button class="btn ghost" id="demoBtn">🖼 Photo d'exemple</button>
+      </div>
+    </div>
+    <div class="frame empty" hidden>
+      <div id="canvasBox">
+        <canvas id="canvas"></canvas>
+        <div id="brushCursor"></div>
+        <div id="baWrap" hidden>
+          <canvas id="origCanvas"></canvas>
+          <span class="ba-tag tag-l" id="tagL">Avant</span>
+          <span class="ba-tag tag-r" id="tagR">Après</span>
+          <div id="baBar"><div class="ba-grip">⇄</div></div>
+        </div>
+        <div id="colorBadge" hidden></div>
+      </div>
+      <div class="empty-state" id="emptyState">
+        <div class="big">🖼</div>
+        <p><strong>Aucune photo</strong><br>Aucune photo chargée</p>
+        <div class="btns">
+          <button class="btn" id="emptyUploadBtn">📁 Ajouter une photo</button>
+          <button class="btn ghost" id="emptyDemoBtn">🎨 Photo d'exemple</button>
+        </div>
+      </div>
+    </div>
+    <div id="colorName">Aucune couleur sélectionnée</div>
+
+<!-- Appareil photo intégré : le flux s'affiche DANS la page (pas de bascule
+     vers une autre app, donc pas de fermeture par le système) -->
+<div id="camModal" hidden>
+  <video id="camVideo" autoplay playsinline muted></video>
+  <div class="cam-bar">
+    <button class="btn ghost" id="camCancel">✕ Annuler</button>
+    <button class="btn" id="camSnap">📸 Capturer</button>
+  </div>
+</div>
+  </main>
+
+  <aside id="rightPanel">
+    <img id="satinLogo" src="logo-satin-deco.png" alt="BLANLUX SATIN DECO">
+    <div class="ptitle">Nuancier Satinée Color <span class="count">42 teintes</span></div>
+    <div id="palette"></div>
+  </aside>
+</div>
+
+<footer><img id="blanluxFooter" src="logo-blanlux.png" alt="BLANLUX"> BLANLUX · SATIN DECO — 100 % local : vos photos ne quittent jamais votre appareil · SegFormer (ADE20K) via Transformers.js</footer>
+
+<!-- Bottom nav mobile (style Stitch) : Capture / Colors / Satin / Finish -->
+<nav class="bottom-nav" aria-hidden="false">
+  <button class="bottom-item" id="bnCapture">
+    <span class="bottom-icon">📷</span><span>Capture</span>
+  </button>
+  <button class="bottom-item active" id="bnColors">
+    <span class="bottom-icon">🎨</span><span>Colors</span>
+  </button>
+  <button class="bottom-item" id="bnSatin">
+    <span class="bottom-icon">🖌️</span><span>Satin</span>
+  </button>
+  <button class="bottom-item" id="bnFinish">
+    <span class="bottom-icon">✔️</span><span>Finish</span>
+  </button>
+</nav>
+<script>
+// Liaison toolbar + bottom nav (additif : réutilise les fonctions existantes).
+(function () {
+  const $id = id => document.getElementById(id);
+  const tbUpload = $id('tbUpload'), tbCapture = $id('tbCapture');
+  const tbBA = $id('tbBA');
+  const bnCapture = $id('bnCapture'), bnColors = $id('bnColors');
+  const bnSatin = $id('bnSatin'), bnFinish = $id('bnFinish');
+
+  // Toolbar : Upload Photo / Capture
+  if (tbUpload) tbUpload.addEventListener('click', () => $id('fileInput').click());
+  if (tbCapture) tbCapture.addEventListener('click', () => openCamera());
+
+  // Avant/Après : affiche/masque le curseur (une fois une couleur appliquée)
+  if (tbBA) tbBA.addEventListener('click', () => {
+    const bw = $id('baWrap');
+    if (!bw) return;
+    if (bw.hidden) { setStatus('Choisissez d\'abord une couleur sur le nuancier.', 'info'); return; }
+    const vis = bw.style.visibility === 'hidden';
+    bw.style.visibility = vis ? 'visible' : 'hidden';
+    tbBA.classList.toggle('active', vis);
+  });
+
+  // Satin / Matte : un seul aspect pour ce produit (bascule retirée).
+
+  // Bottom nav (mobile)
+  if (bnCapture) bnCapture.addEventListener('click', () => openCamera());
+  if (bnColors) bnColors.addEventListener('click', () => {
+    const rp = $id('rightPanel');
+    if (rp) rp.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+  if (bnSatin) bnSatin.addEventListener('click', () => {
+    const lp = $id('leftPanel');
+    if (lp) lp.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+  if (bnFinish) bnFinish.addEventListener('click', () => $id('downloadBtn').click());
+
+  // État vide (téléphone) : boutons Ajouter une photo / Photo d'exemple
+  const frameEmpty = $id('emptyState')?.closest('.frame');
+  if (!document.body.classList.contains('phone') && frameEmpty) frameEmpty.classList.remove('empty');
+  const emptyUploadBtn = $id('emptyUploadBtn'), emptyDemoBtn = $id('emptyDemoBtn');
+  if (emptyUploadBtn) emptyUploadBtn.addEventListener('click', () => $id('fileInput').click());
+  if (emptyDemoBtn) emptyDemoBtn.addEventListener('click', () => $id('demoBtn').click());
+})();
+</script>
+</body>
+</html>
