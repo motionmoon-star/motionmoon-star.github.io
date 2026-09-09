@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
@@ -24,6 +24,8 @@ const resetBtn = $('resetBtn');
 const downloadBtn = $('downloadBtn');
 const strengthSlider = $('strength');
 const strengthVal = $('strengthVal');
+const reliefSlider = $('relief');
+const reliefVal = $('texVal');
 const frame = document.querySelector('.frame');
 const baWrap = $('baWrap');
 const baBar = $('baBar');
@@ -418,6 +420,11 @@ canvas.addEventListener('click', e => {
 
 strengthSlider.addEventListener('input', () => {
   strengthVal.textContent = Math.round(strengthSlider.value * 100) + '%';
+  if (selectedColor && wallMask) applyColor();
+});
+
+reliefSlider.addEventListener('input', () => {
+  reliefVal.textContent = reliefSlider.value + '%';
   if (selectedColor && wallMask) applyColor();
 });
 
@@ -969,8 +976,10 @@ function applyColor() {
     const t = strength * wgt;
     const i = p * 4;
     const [L0] = pixToLab(src[i], src[i + 1], src[i + 2]);
-    // Texture préservée : L local (relief du mur) + décalage global de luminosité
-    const L1 = Math.min(97, Math.max(3, L0 + dL));
+    // Texture préservée : L local (relief du mur) + décalage global de luminosité.
+    // Relief : 0% = rendu actuel (f=1), 100% = relief doublé (f=2).
+    const f = 1 + parseFloat(reliefSlider.value) / 100;
+    const L1 = Math.min(97, Math.max(3, avgL + dL + (L0 - avgL) * f));
     // Désaturation douce dans les ombres profondes et les reflets brillants (rolloff)
     const roll = Math.min(1, Math.min(L1, 100 - L1) / 12);
     const rgb = labToPix(L1, ac * roll, bc * roll);
@@ -1044,6 +1053,257 @@ function hexToRgb(hex) {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 const clamp = v => v < 0 ? 0 : v > 255 ? 255 : v;
+
+// =====================================================================
+// ASSISTANT HARMONIE DES COULEURS
+// =====================================================================
+// Conseille une couleur de mur à partir de la couleur d'un élément de déco,
+// en calculant des harmonies (complémentaire, split, analogue, triadique),
+// puis en alignant chaque cible sur la teinte officielle BLANLUX la plus proche.
+
+function rgbToHex(r, g, b) {
+  return '#' + [r, g, b].map(v => clamp(Math.round(v)).toString(16).padStart(2, '0')).join('');
+}
+function hexToHsl(hex) {
+  let r, g, b;
+  if (hex[0] === '#') { r = parseInt(hex.slice(1, 3), 16); g = parseInt(hex.slice(3, 5), 16); b = parseInt(hex.slice(5, 7), 16); }
+  else { [r, g, b] = hexToRgb(hex); }
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h = 0, s = 0;
+  const l = (max + min) / 2;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    switch (max) {
+      case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+      case g: h = (b - r) / d + 2; break;
+      default: h = (r - g) / d + 4;
+    }
+    h *= 60;
+  }
+  return [((h % 360) + 360) % 360, s * 100, l * 100];
+}
+function hslToHex(h, s, l) {
+  h = ((h % 360) + 360) % 360; s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return rgbToHex(Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255));
+}
+
+// Harmonies : rotations sur le tour de roue HSL (en degrés)
+const HARMONY_RULES = {
+  complementary:        { label: 'Complémentaire',   rotations: [180] },
+  'split-complementary':{ label: 'Split-complémentaire', rotations: [150, 210] },
+  analogous:            { label: 'Analogue',         rotations: [-30, 30] },
+  triadic:              { label: 'Triadique',        rotations: [120, 240] }
+};
+
+// Palettes curées pour les couleurs de déco neutres (noir, charcoal, off-white, greige)
+const NEUTRAL_PALETTES = [
+  { name: 'Warm Natural Contrast', colors: ['#F5F2EB', '#C97A63'] },
+  { name: 'Modern Muted',          colors: ['#8A9A86', '#4A5568'] },
+  { name: 'Bold Accent',           colors: ['#C68B59', '#3B7A8C'] }
+];
+
+// Conseils designer par grande famille de déco
+const DECOR_TIPS = {
+  black:   'Un élément noir ancre la pièce. L\'associer à des tons chauds, opposés et terreux, ou à des blancs cassés, évite que la pièce ne paraisse stérile.',
+  navy:    'Le bleu marine se marie directement avec les tons chauds ocre et terracotta, en face sur la roue, pour équilibrer les températures froides et chaudes.',
+  green:   'Un vert profond gagne à être rehaussé par un doux contraste chaud — sable, crème ou terre cuite — pour adoucir la fraîcheur de la teinte.',
+  warm:    'Le cognac et les chênes clairs apportent de la chaleur : une teinte murale froide et posée ou un crème lumineux prolonge harmonieusement cette assise.',
+  neutral: 'Sur une assise neutre, misez sur une gamme chaleureuse et naturelle (crème, terracotta) ou un rappel vert sauge, pour un intérieur apaisé et vivant.',
+  default: 'Cette teinte de déco peut guider une couleur de mur : cherchez son opposée pour un contraste vif, ou une teinte analogue pour une ambiance apaisée.'
+};
+
+const harmony = {
+  decor: null,          // { hex, hue, sat, light, isNeutral }
+  rule: 'complementary',
+  wall: null            // hex de la couleur de mur active
+};
+
+const $harm = {
+  sec: $('harmSec'), toggle: $('harmToggle'), body: $('harmBody'), caret: $('harmCaret'),
+  decor: $('harmDecor'), picker: $('decoPicker'), pickerSwatch: $('decoPickerSwatch'),
+  rules: $('harmRules'), wheel: $('harmWheel'), cards: $('harmCards'), tips: $('harmTips')
+};
+
+// Index du nuancier officiel (hex -> { num, name }) pour l'alignement
+const PALETTE_HSL = PALETTE.map(([num, name, hex]) => ({ num, name, hex, hsl: hexToHsl(hex) }));
+
+function decorInfo(hex) {
+  const [hue, sat, light] = hexToHsl(hex);
+  const isNeutral = light < 15 || sat < 10;
+  return { hex, hue, sat, light, isNeutral };
+}
+
+// Aligne une couleur cible sur la teinte officielle BLANLUX la plus proche (distance HSL)
+function nearestBlanlux(hueTarget, satTarget, lightTarget) {
+  let best = null, bestD = Infinity;
+  for (const c of PALETTE_HSL) {
+    const dh = Math.min(Math.abs(c.hsl[0] - hueTarget), 360 - Math.abs(c.hsl[0] - hueTarget));
+    const ds = Math.abs(c.hsl[1] - satTarget);
+    const dl = Math.abs(c.hsl[2] - lightTarget);
+    const d = dh * dh * 2 + ds * ds + dl * dl;
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  return best;
+}
+
+function tipForDecor(decor) {
+  const [hue, sat, light] = hexToHsl(decor.hex);
+  const dark = light < 30;
+  const lowSat = sat < 18;
+  const warm = hue >= 20 && hue <= 75 && !lowSat;
+  if (dark && lowSat) return DECOR_TIPS.black;      // noir / charcoal
+  if (hue >= 205 && hue <= 260) return DECOR_TIPS.navy;
+  if (hue >= 90 && hue <= 175) return DECOR_TIPS.green;
+  if (warm) return DECOR_TIPS.warm;
+  if (lowSat) return DECOR_TIPS.neutral;
+  return DECOR_TIPS.default;
+}
+
+function computeTargets(decor) {
+  if (decor.isNeutral) return null; // palettes curées
+  return HARMONY_RULES[harmony.rule].rotations.map(rot => {
+    const targetHue = ((decor.hue + rot) % 360 + 360) % 360;
+    return nearestBlanlux(targetHue, decor.sat, decor.light);
+  });
+}
+
+function renderWheel(decor) {
+  $harm.wheel.innerHTML = '';
+  if (decor.isNeutral) {
+    // Neutre : pas de roue de teinte pertinente → palettes catégorisées
+    const wrap = document.createElement('div');
+    wrap.className = 'harm-neutrals';
+    wrap.innerHTML = NEUTRAL_PALETTES.map(p =>
+      `<div class="harm-np"><span class="np-sws">${p.colors.map(c => `<span style="background:${c}" title="${c}"></span>`).join('')}</span><span>${p.name}</span></div>`
+    ).join('');
+    $harm.wheel.appendChild(wrap);
+    return;
+  }
+  const R = 70, C = 90, G = 90;
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 180 180');
+  // Anneau de teinte
+  for (let i = 0; i < 360; i += 3) {
+    const a0 = (i - 90) * Math.PI / 180, a1 = (i + 3 - 90) * Math.PI / 180;
+    const x0 = C + R * Math.cos(a0), y0 = G + R * Math.sin(a0);
+    const x1 = C + R * Math.cos(a1), y1 = G + R * Math.sin(a1);
+    const hue = i;
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', `M${x0.toFixed(1)},${y0.toFixed(1)} A${R},${R} 0 0 1 ${x1.toFixed(1)},${y1.toFixed(1)}`);
+    path.setAttribute('stroke', `hsl(${hue},70%,55%)`);
+    path.setAttribute('stroke-width', '14');
+    path.setAttribute('fill', 'none');
+    svg.appendChild(path);
+  }
+  const marker = (hue, color, r0) => {
+    const a = (hue - 90) * Math.PI / 180;
+    const x = C + R * Math.cos(a), y = G + R * Math.sin(a);
+    const c = document.createElementNS(NS, 'circle');
+    c.setAttribute('cx', x); c.setAttribute('cy', y);
+    c.setAttribute('r', r0); c.setAttribute('fill', color);
+    c.setAttribute('stroke', '#fff'); c.setAttribute('stroke-width', '2');
+    svg.appendChild(c);
+  };
+  // Cibles harmonisées
+  HARMONY_RULES[harmony.rule].rotations.forEach(rot => {
+    const th = ((decor.hue + rot) % 360 + 360) % 360;
+    marker(th, '#5aa0ff', 5);
+  });
+  // Teinte de déco
+  marker(decor.hue, '#ffd047', 6.5);
+  $harm.wheel.appendChild(svg);
+}
+
+function renderCards(decor) {
+  $harm.cards.innerHTML = '';
+  let cards = [];
+  if (decor.isNeutral) {
+    NEUTRAL_PALETTES.forEach(p => p.colors.forEach(hex => {
+      const tgt = nearestBlanlux(...hexToHsl(hex));
+      cards.push({ pal: p.name, ...tgt });
+    }));
+  } else {
+    HARMONY_RULES[harmony.rule].rotations.forEach(rot => {
+      const th = ((decor.hue + rot) % 360 + 360) % 360;
+      const tgt = nearestBlanlux(th, decor.sat, decor.light);
+      cards.push({ pal: HARMONY_RULES[harmony.rule].label, ...tgt });
+    });
+  }
+  if (!cards.length) {
+    $harm.cards.innerHTML = '<div class="harm-empty">Aucune teinte recommandée.</div>';
+    return;
+  }
+  cards.forEach(c => {
+    const card = document.createElement('button');
+    card.className = 'harm-card' + (harmony.wall === c.hex ? ' active' : '');
+    card.innerHTML =
+      `<span class="hc-sq" style="background:${c.hex}"></span>` +
+      `<span class="hc-meta"><span class="hc-name">${c.num} · ${c.name}</span><span class="hc-hex">${c.hex}</span></span>` +
+      `<span class="hc-badge">${c.pal}</span>`;
+    card.title = 'Appliquer cette teinte de mur';
+    card.addEventListener('click', () => {
+      harmony.wall = c.hex;
+      // Aligne aussi la sélection du nuancier officiel
+      const match = [...document.querySelectorAll('.swatch-item')].find(s => (s.getAttribute('title') || '').includes(c.name) && s.textContent.includes(c.hex));
+      selectColor(c.hex, `${c.num} · ${c.name}`, match || card);
+      document.querySelectorAll('.harm-card').forEach(x => x.classList.toggle('active', x === card));
+    });
+    $harm.cards.appendChild(card);
+  });
+}
+
+function renderTips(decor) {
+  $harm.tips.classList.toggle('harm-tips-idle', false);
+  $harm.tips.textContent = tipForDecor(decor);
+}
+
+function renderHarmony() {
+  const decor = harmony.decor;
+  if (!decor) {
+    $harm.wheel.innerHTML = '';
+    $harm.cards.innerHTML = '<div class="harm-empty">Choisissez une couleur de déco pour voir les recommandations.</div>';
+    $harm.tips.classList.add('harm-tips-idle');
+    $harm.tips.textContent = 'Choisissez une couleur de déco pour afficher un conseil.';
+    return;
+  }
+  renderWheel(decor);
+  renderCards(decor);
+  renderTips(decor);
+}
+
+function setDecor(hex) {
+  harmony.decor = decorInfo(hex);
+  $harm.pickerSwatch.style.background = hex;
+  $harm.picker.value = hex;
+  $harm.decor.querySelector('.deco-picker').classList.add('active');
+  renderHarmony();
+}
+
+// ---- Events ----
+$harm.toggle.addEventListener('click', () => {
+  const open = $harm.body.hidden;
+  $harm.body.hidden = !open;
+  $harm.toggle.setAttribute('aria-expanded', String(open));
+  $harm.caret.textContent = open ? '−' : '+';
+});
+$harm.picker.addEventListener('input', e => {
+  setDecor(e.target.value);
+});
+$harm.rules.addEventListener('click', e => {
+  const btn = e.target.closest('.rule-btn[data-rule]');
+  if (!btn) return;
+  document.querySelectorAll('#harmRules .rule-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  harmony.rule = btn.dataset.rule;
+  if (harmony.decor) { renderWheel(harmony.decor); renderCards(harmony.decor); }
+});
+
 </script>
 <style>
 :root {
@@ -1389,6 +1649,102 @@ body:not(.mobile) #rightPanel #palette { flex: 1 1 0; min-height: 0; }
 #colorName .dot { width: 15px; height: 15px; border-radius: 50%; display: inline-block; border: 2px solid rgba(255,255,255,.4); }
 #colorName code { color: var(--accent2); font-size: 11px; }
 
+/* ---- Assistant Harmonie des Couleurs ---- */
+.harm-sec {
+  margin-bottom: 18px; border: 1px solid var(--border);
+  border-radius: 12px; background: var(--panel2); overflow: hidden;
+}
+.harm-head {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; padding: 12px 13px; cursor: pointer; border: none;
+  background: transparent; color: var(--text); font-family: inherit;
+  text-transform: uppercase; letter-spacing: .1em; font-weight: 700; font-size: 11px;
+}
+.harm-head:hover { background: #1a2132; }
+.harm-head[aria-expanded="true"] .harm-caret { transform: rotate(45deg); }
+.harm-caret { transition: transform .18s ease; color: var(--accent2); font-size: 16px; }
+.harm-body { padding: 4px 13px 13px; border-top: 1px solid var(--border); }
+.harm-intro { font-size: 11px; color: var(--muted); line-height: 1.4; margin-bottom: 12px; }
+.harm-block { margin-top: 12px; }
+.harm-block:first-of-type { margin-top: 0; }
+.harm-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+  font-weight: 700; color: var(--muted); margin-bottom: 7px;
+}
+
+/* Sélecteur de déco : préréglés + pipette */
+.harm-decor { display: grid; grid-template-columns: 1fr; gap: 7px; }
+.deco-btn {
+  display: flex; flex-direction: row; align-items: center; justify-content: center; gap: 8px;
+  padding: 10px 8px; border-radius: 10px; background: var(--bg2);
+  border: 1px solid var(--border); color: var(--text); cursor: pointer;
+  font-size: 11px; font-weight: 600; transition: .15s; font-family: inherit; text-align: center;
+  position: relative; overflow: hidden;
+}
+.deco-btn:hover { background: #1d2436; }
+.deco-btn.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(90,160,255,.35); }
+.deco-btn .sq { width: 34px; height: 34px; border-radius: 8px; border: 1px solid rgba(0,0,0,.3); box-shadow: inset 0 0 0 1px rgba(255,255,255,.12); }
+.deco-picker { cursor: pointer; }
+.deco-picker input[type="color"] {
+  position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+}
+.harm-decor .deco-picker .sq { pointer-events: none; }
+
+/* Règle d'harmonie (segmentée) */
+.harm-rules { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.rule-btn {
+  padding: 7px 4px; border-radius: 8px; background: var(--bg2);
+  border: 1px solid var(--border); color: var(--muted); cursor: pointer;
+  font-size: 10px; font-weight: 700; transition: .15s; font-family: inherit; text-align: center;
+}
+.rule-btn:hover { color: var(--text); }
+.rule-btn.active { background: var(--grad); color: #fff; border-color: transparent; }
+
+/* Roue chromatique */
+.harm-wheel-wrap { display: flex; justify-content: center; }
+.harm-wheel-wrap svg { width: 100%; max-width: 180px; height: auto; display: block; }
+.harm-neutrals {
+  display: flex; flex-direction: column; gap: 8px; width: 100%;
+}
+.harm-neutrals .harm-np {
+  display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--muted);
+}
+.harm-neutrals .harm-np .np-sws { display: flex; gap: 4px; }
+.harm-neutrals .harm-np .np-sws span { width: 22px; height: 22px; border-radius: 6px; border: 1px solid rgba(0,0,0,.3); }
+
+/* Cartes de mur recommandées */
+.harm-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.harm-card {
+  display: flex; flex-direction: column; gap: 6px; padding: 8px 7px;
+  border-radius: 10px; background: var(--bg2); border: 1px solid var(--border);
+  cursor: pointer; transition: .15s; font-family: inherit; color: var(--text); text-align: left;
+}
+.harm-card:hover { background: #1d2436; }
+.harm-card.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(90,160,255,.35); }
+.harm-card .hc-sq { width: 100%; height: 40px; border-radius: 7px; border: 1px solid rgba(0,0,0,.3); box-shadow: inset 0 0 0 1px rgba(255,255,255,.12); }
+.harm-card .hc-meta { font-size: 10px; line-height: 1.25; }
+.harm-card .hc-meta .hc-name { font-weight: 700; }
+.harm-card .hc-meta .hc-hex { color: var(--muted); font-family: var(--mono); font-size: 9px; }
+.harm-card .hc-badge {
+  align-self: flex-start; font-size: 8px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .05em; padding: 2px 6px; border-radius: 999px;
+  background: rgba(90,160,255,.14); color: var(--accent2); border: 1px solid rgba(90,160,255,.25);
+}
+.harm-empty { grid-column: 1 / -1; font-size: 11px; color: var(--muted); text-align: center; padding: 12px 4px; }
+
+/* Conseils du designer */
+.harm-tips {
+  font-size: 12px; line-height: 1.5; color: var(--text);
+  background: linear-gradient(135deg, rgba(38,84,190,.16), rgba(22,60,150,.08));
+  border: 1px solid var(--border); border-radius: 10px; padding: 10px 11px;
+}
+.harm-tips.harm-tips-idle { color: var(--muted); background: var(--bg2); }
+
+/* Bandeau haut de la section repliée sur mobile : nuancier prioritaire, section repliée par défaut */
+@media (max-width: 900px) {
+  .harm-sec { max-height: none; }
+}
+
 footer {
   margin-top: 26px; color: var(--muted); font-size: 12px; text-align: center;
   display: flex; align-items: center; justify-content: center; gap: 8px; flex-wrap: wrap;
@@ -1549,6 +1905,10 @@ body.phone .frame.empty .btns .btn { font-size: 13px; padding: 10px 16px; }
           <label>Intensité <span id="strengthVal">90%</span></label>
           <input type="range" id="strength" min="0.3" max="1" step="0.05" value="0.9">
         </div>
+        <div class="slider-box">
+          <label>Relief <span id="texVal">0%</span></label>
+          <input type="range" id="relief" min="0" max="100" step="5" value="0">
+        </div>
       </div>
     </section>
 
@@ -1636,6 +1996,57 @@ body.phone .frame.empty .btns .btn { font-size: 13px; padding: 10px 16px; }
 
   <aside id="rightPanel">
     <img id="satinLogo" src="logo-satin-deco.png" alt="BLANLUX SATIN DECO">
+
+    <!-- Assistant Harmonie des Couleurs : conseille une couleur de mur à partir
+         de la couleur d'un élément de déco, aligné sur le nuancier officiel. -->
+    <section class="harm-sec" id="harmSec">
+      <button class="harm-head ptitle" id="harmToggle" aria-expanded="false" aria-controls="harmBody">
+        <span>Harmonie des couleurs</span>
+        <span class="harm-caret" id="harmCaret">+</span>
+      </button>
+      <div class="harm-body" id="harmBody" hidden>
+        <div class="harm-intro">Choisissez la couleur d'un élément de déco (fauteuil, tissu…) pour obtenir des teintes de mur en harmonie.</div>
+
+        <div class="harm-block">
+          <div class="harm-label">Couleur de déco</div>
+          <div class="harm-decor" id="harmDecor">
+            <label class="deco-btn deco-picker active" title="Sélectionner la couleur dominante de la déco (meuble, tissu…)">
+              <span class="sq" id="decoPickerSwatch" style="background:#8B4513"></span>
+              <span>Choisir la couleur dominante de la déco</span>
+              <input type="color" id="decoPicker" value="#8B4513">
+            </label>
+          </div>
+        </div>
+
+        <div class="harm-block">
+          <div class="harm-label">Règle d'harmonie</div>
+          <div class="harm-rules" id="harmRules">
+            <button class="rule-btn active" data-rule="complementary">Complémentaire</button>
+            <button class="rule-btn" data-rule="split-complementary">Split</button>
+            <button class="rule-btn" data-rule="analogous">Analogue</button>
+            <button class="rule-btn" data-rule="triadic">Triadique</button>
+          </div>
+        </div>
+
+        <div class="harm-block">
+          <div class="harm-label">Roue chromatique</div>
+          <div class="harm-wheel-wrap" id="harmWheel"></div>
+        </div>
+
+        <div class="harm-block">
+          <div class="harm-label">Teintes de mur recommandées</div>
+          <div class="harm-cards" id="harmCards">
+            <div class="harm-empty">Choisissez une couleur de déco pour voir les recommandations.</div>
+          </div>
+        </div>
+
+        <div class="harm-block">
+          <div class="harm-label">Conseil du designer</div>
+          <div class="harm-tips" id="harmTips">Choisissez une couleur de déco pour afficher un conseil.</div>
+        </div>
+      </div>
+    </section>
+
     <div class="ptitle">Nuancier Satinée Color <span class="count">42 teintes</span></div>
     <div id="palette"></div>
   </aside>
